@@ -31,6 +31,33 @@ _SKIP_MOD = {"__builtins__", "__loader__", "__spec__", "__file__", "__cached__",
              "__package__", "__name__"}
 _SKIP_CLS = {"__dict__", "__weakref__", "_abc_impl"}
 
+# The isinstance chain of _W.walk, in its order, as one category per type.
+_CHAIN = (
+    (enum.Enum, 1), (types.ModuleType, 2), (type, 3), (types.FunctionType, 4),
+    ((staticmethod, classmethod), 5), (property, 6), (types.CodeType, 7),
+    (types.BuiltinFunctionType, 8), ((list, tuple), 9), (dict, 10),
+    ((set, frozenset), 11), (types.MethodType, 12),
+)
+_CAT: dict = {}
+
+
+def _category(o) -> int:
+    """Which branch of the chain `o` takes: what the isinstance calls in
+    order would say. Cached per type, unless the object reports a
+    __class__ other than its type, which isinstance also consults."""
+    t = type(o)
+    c = _CAT.get(t)
+    if c is not None and getattr(o, "__class__", t) is t:
+        return c
+    c = 0
+    for kind, n in _CHAIN:
+        if isinstance(o, kind):
+            c = n
+            break
+    if getattr(o, "__class__", t) is t:
+        _CAT[t] = c
+    return c
+
 
 class _W:
     def __init__(self, loose: bool = False):
@@ -76,18 +103,19 @@ class _W:
         if t in _SCALARS:
             out.append(t.__name__[:2] + repr(o))
             return
-        if isinstance(o, enum.Enum):
+        cat = _category(o)
+        if cat == 1:
             out.append(f"E{t.__module__}.{t.__qualname__}.{o.name}")
             return
-        if isinstance(o, types.ModuleType):
+        if cat == 2:
             out.append("M" + o.__name__)
             return
-        if isinstance(o, type):
+        if cat == 3:
             out.append(f"C{o.__module__}.{o.__qualname__}")
             return
         if self.ref(o):
             return
-        if isinstance(o, (types.FunctionType,)):
+        if cat == 4:
             out.append(f"F{o.__module__}.{o.__qualname__}")
             self.walk(o.__defaults__)
             self.walk(o.__kwdefaults__)
@@ -105,22 +133,22 @@ class _W:
             if w is not None:
                 self.walk(w)
             return
-        if isinstance(o, (staticmethod, classmethod)):
+        if cat == 5:
             out.append("S" + t.__name__)
             self.walk(o.__func__)
             return
-        if isinstance(o, property):
+        if cat == 6:
             out.append("P")
             self.walk((o.fget, o.fset, o.fdel))
             return
-        if isinstance(o, types.CodeType):
+        if cat == 7:
             # code is what the AST diff compares; here only where it is held
             out.append(f"X{o.co_filename.rsplit('/sqlglot/', 1)[-1]}:{o.co_qualname}")
             return
-        if isinstance(o, types.BuiltinFunctionType):
+        if cat == 8:
             out.append(f"B{getattr(o, '__module__', '')}.{o.__qualname__}")
             return
-        if isinstance(o, (list, tuple)):
+        if cat == 9:
             out.append(f"L{t.__qualname__}{len(o)}")
             seq = list(o)
             if self.loose:
@@ -135,7 +163,7 @@ class _W:
             for v in seq:
                 self.walk(v)
             return
-        if isinstance(o, dict):
+        if cat == 10:
             out.append(f"D{t.__module__}.{t.__qualname__}{len(o)}")
             df = getattr(o, "default_factory", None)
             if df is not None:
@@ -150,7 +178,7 @@ class _W:
                 self.walk(k)
                 self.walk(v)
             return
-        if isinstance(o, (set, frozenset)):
+        if cat == 11:
             keyed = []
             for v in o:
                 k = self.key(v)
@@ -160,7 +188,7 @@ class _W:
             for _, v in keyed:
                 self.walk(v)
             return
-        if isinstance(o, types.MethodType):
+        if cat == 12:
             out.append("m")
             self.walk(o.__func__)
             self.walk(o.__self__)

@@ -17,6 +17,9 @@ from __future__ import annotations
 import ast
 import bisect
 import difflib
+# as _gc: child_verify imports gc locally further down, which makes a bare
+# `gc` local to the whole function, unbound before that line
+import gc as _gc
 import gzip
 import json
 import os
@@ -700,16 +703,62 @@ def _dump(node) -> str:
     return ast.dump(node)
 
 
-def _header(node) -> str:
+class _Dumper:
+    """ast.dump(node) with each node formatted once. diff_ast dumps a class
+    whole, then its body statement by statement, then their bodies again;
+    the memo makes that one pass. Keyed by id(), so it lives only as long as
+    the trees it saw. Same text as ast.dump with its defaults (no indent:
+    the simple flag never changes the text)."""
+
+    def __init__(self):
+        self.memo: dict = {}
+        self.keep: list = []
+
+    def __call__(self, node) -> str:
+        k = id(node)
+        r = self.memo.get(k)
+        if r is not None:
+            return r
+        cls = type(node)
+        args = []
+        for name in node._fields:
+            try:
+                value = getattr(node, name)
+            except AttributeError:
+                continue
+            if value is None and getattr(cls, name, ...) is None:
+                continue
+            if value == []:
+                field_type = cls._field_types.get(name, object)
+                if getattr(field_type, "__origin__", ...) is list:
+                    continue
+            args.append(name + "=" + self.value(value))
+        r = cls.__name__ + "(" + ", ".join(args) + ")"
+        self.memo[k] = r
+        self.keep.append(node)  # ids stay unique while the memo lives
+        return r
+
+    def value(self, v) -> str:
+        if isinstance(v, ast.AST):
+            return self(v)
+        if isinstance(v, list):
+            if not v:
+                return "[]"
+            return "[" + ", ".join(self.value(x) for x in v) + "]"
+        return repr(v)
+
+
+def _header(node, dump=None) -> str:
+    _dump_ = dump or _dump
     parts = []
     for f in node._fields:
         if f in BODY_FIELDS:
             continue
         v = getattr(node, f, None)
         if isinstance(v, list):
-            parts.append(f + "=[" + ",".join(_dump(x) if isinstance(x, ast.AST) else repr(x) for x in v) + "]")
+            parts.append(f + "=[" + ",".join(_dump_(x) if isinstance(x, ast.AST) else repr(x) for x in v) + "]")
         elif isinstance(v, ast.AST):
-            parts.append(f + "=" + _dump(v))
+            parts.append(f + "=" + _dump_(v))
         else:
             parts.append(f + "=" + repr(v))
     return "|".join(parts)
@@ -740,10 +789,11 @@ class Site:
 
 def diff_ast(old_tree, new_tree) -> list[Site]:
     sites: list[Site] = []
+    dump = _Dumper()
 
     def walk_block(ob, nb, scope, parent):
-        od = [_dump(s) for s in ob]
-        nd = [_dump(s) for s in nb]
+        od = [dump(s) for s in ob]
+        nd = [dump(s) for s in nb]
         if od == nd:
             return
         sm = difflib.SequenceMatcher(None, od, nd, autojunk=False)
@@ -767,7 +817,7 @@ def diff_ast(old_tree, new_tree) -> list[Site]:
             return
         has_body = any(isinstance(getattr(o, f, None), list) and getattr(o, f) for f in BODY_FIELDS)
         if has_body:
-            if _header(o) != _header(n):
+            if _header(o, dump) != _header(n, dump):
                 sites.append(Site(scope, "header", [o], parent=parent, new=[n]))
                 return
             inner = scope
@@ -2616,6 +2666,21 @@ def _swap_norm(tree):
     return ast.dump(tree, include_attributes=False)
 
 
+_SWAP_TOKEN = re.compile(r"==|!=|\bis\b")
+
+
+def swap_possible(patch_text: str) -> bool:
+    """False when no added or removed line of the patch holds `is`, `==` or
+    `!=`. Lines outside the hunks are the same text on both sides, so the
+    comparison operators then appear in the same order in old and new, and
+    no comparison can have swapped. swap_sites would parse and walk both
+    trees only to return None. A wrong False only keeps tests."""
+    for line in patch_text.splitlines():
+        if line[:1] in "+-" and not line.startswith(("+++", "---")) and _SWAP_TOKEN.search(line):
+            return True
+    return False
+
+
 def swap_sites(patched: dict) -> list | None:
     """When the patch only swaps `is` with `==` (or `is not` with `!=`) in
     single-operator comparisons of sqlglot modules, the pinned-tree keys
@@ -3190,6 +3255,29 @@ class _Collector:
         signal.setitimer(signal.ITIMER_REAL, 0)
 
 
+def _fp_imported_all(out_path: str, fp_pid: int) -> bool:
+    """Waits for the sibling fingerprint process. True when it found every
+    package module importing, to the pinned state. False when it found a
+    difference, or ended without saying (the child reaps it first, so a
+    dead sibling stops the wait)."""
+    done = out_path + ".fpdone"
+    while True:
+        try:
+            with open(done) as f:
+                return f.read() == "1"
+        except OSError:
+            pass
+        try:
+            os.kill(fp_pid, 0)
+        except OSError:
+            try:
+                with open(done) as f:
+                    return f.read() == "1"
+            except OSError:
+                return False
+        time.sleep(0.01)
+
+
 def child_verify(job: dict, out_path: str):
     """Runs in a forked child. Writes {"failed": [...], "passed": [...]} or an error."""
     import shutil
@@ -3244,6 +3332,13 @@ def child_verify(job: dict, out_path: str):
                             f.write(f"{type(e).__name__}: {e}")
                     except BaseException:  # noqa: BLE001
                         pass
+                try:
+                    # for the import-all process below, which waits on this
+                    with open(out_path + ".fpdone.tmp", "w") as f:
+                        f.write("1" if ok else "0")
+                    os.rename(out_path + ".fpdone.tmp", out_path + ".fpdone")
+                except BaseException:  # noqa: BLE001
+                    pass
                 os._exit(0 if ok else 3)
         if job.get("collect"):
             col_pid = os.fork()
@@ -3302,6 +3397,18 @@ def child_verify(job: dict, out_path: str):
             all_pid = os.fork()
             if all_pid == 0:
                 try:
+                    # only imports run here: what the child imported is never
+                    # garbage, so keep the collector off it. Inside the try:
+                    # an error out here would run the child's own cleanup,
+                    # which removes the farm the child is still using.
+                    _gc.freeze()
+                    if fp_pid and _fp_imported_all(out_path, fp_pid):
+                        # the fingerprint process imported every module too,
+                        # and each one to its pinned state: nothing is left
+                        # here to fail
+                        with open(out_path + ".impall", "w") as f:
+                            json.dump([], f)
+                        os._exit(0)
                     bad = []
                     for dp, _dn, fns in os.walk("sqlglot", followlinks=True):
                         for fn in sorted(fns):
@@ -3364,14 +3471,6 @@ def child_verify(job: dict, out_path: str):
         result = {"error": f"{type(e).__name__}: {e}"}
     if col_result is not None and "failed" in result:
         result["collected"] = col_result
-    if all_pid:
-        try:
-            os.waitpid(all_pid, 0)
-            with open(out_path + ".impall") as f:
-                result["impall"] = json.load(f)
-            os.unlink(out_path + ".impall")
-        except BaseException:  # noqa: BLE001
-            pass
     if fp_pid:
         try:
             _, st = os.waitpid(fp_pid, 0)
@@ -3384,6 +3483,18 @@ def child_verify(job: dict, out_path: str):
             os.unlink(out_path + ".fperr")
         except OSError:
             pass
+    if all_pid:
+        try:
+            os.waitpid(all_pid, 0)
+            with open(out_path + ".impall") as f:
+                result["impall"] = json.load(f)
+            os.unlink(out_path + ".impall")
+        except BaseException:  # noqa: BLE001
+            pass
+    try:
+        os.unlink(out_path + ".fpdone")
+    except OSError:
+        pass
     try:
         with open(out_path, "w") as f:
             json.dump(result, f)
@@ -3404,6 +3515,31 @@ class Verifier:
         import pytest  # noqa: F401
         import _pytest.unittest  # noqa: F401
         import _pytest.python  # noqa: F401
+        import importlib
+
+        # Modules every pytest.main imports while it configures, before it
+        # collects a test module: loaded once here instead of in each child.
+        # A fresh pytest run has them all loaded before any test code runs.
+        # Not concurrent.futures: it adds loggers, and the import-state
+        # fingerprint reaches the logger registry through module loggers.
+        for name in ("_pytest._argcomplete", "_pytest.faulthandler", "_pytest.helpconfig",
+                     "_pytest.junitxml", "_pytest.pastebin", "_pytest.setuponly",
+                     "_pytest.setupplan", "_pytest.skipping", "_pytest.threadexception",
+                     "_pytest.tracemalloc", "_pytest.unraisableexception", "_pytest.warnings",
+                     "tomllib", "pdb", "faulthandler", "fractions", "xml.etree.ElementTree"):
+            try:
+                importlib.import_module(name)
+            except Exception:  # noqa: BLE001
+                pass
+
+    @staticmethod
+    def _fork() -> int:
+        # The parent's heap (map, ASTs, analyses) is dead weight in a child.
+        # Frozen, the child's collector never walks it: no CPU, and no
+        # copy-on-write faults from touching its GC headers. A child can
+        # not tell: these objects are never garbage it would collect.
+        _gc.freeze()
+        return os.fork()
 
     def run(self, jobs: list[dict]):
         queue = list(jobs)
@@ -3418,7 +3554,7 @@ class Verifier:
                 queue.pop(0)
                 out_path = os.path.join(TMP, f"res_{job['commit']}.json")
                 job["farm"] = os.path.join(TMP, f"farm_{job['commit']}")
-                pid = os.fork()
+                pid = self._fork()
                 if pid == 0:
                     child_verify(job, out_path)
                 self.running[pid] = (job, out_path, now)
@@ -3542,7 +3678,8 @@ def main():
             a.cand = mp.all
         elif a.applied and eqprof:
             try:
-                keys = swap_sites(a.patched)
+                # a swap can only clear candidates: none, nothing to do
+                keys = swap_sites(a.patched) if a.cand and swap_possible(text) else None
                 if keys:
                     clr = swap_cleared(keys, eqprof, mp, num_of_id) & a.cand
                     if clr:

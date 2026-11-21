@@ -24,7 +24,11 @@ COPY app /app
 RUN python /app/selector.py --build-index \
  && cd /opt/sqlglot && PYTHONPATH=/opt/sqlglot python /app/proxy.py --baseline /app/proxy_base.json \
  && PYTHONPATH=/opt/sqlglot python /app/impfp.py --baseline /app/impfp_base.json \
- && python -m compileall -q /app && chmod -R a+rX /app
+ && python -m compileall -q /app \
+ && python -c "import py_compile; py_compile.compile('/app/selector.py', cfile='/app/main.pyc', doraise=True)" \
+ && chmod -R a+rX /app
 
 ENV SKIP_INTEGRATION=0 PYTHONUNBUFFERED=1
-CMD ["python", "/app/selector.py"]
+# A script given as .py is compiled on every start (0.05 s of CPU); its
+# bytecode runs the same, with /app as sys.path[0] all the same.
+CMD ["python", "/app/main.pyc"]
