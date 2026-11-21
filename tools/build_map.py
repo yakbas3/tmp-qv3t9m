@@ -6,7 +6,8 @@
 Builds the entry image (linux/amd64), runs sqlglot's own test suite inside it
 in a few shards with tools/map_plugin.py loaded, and merges what each test
 touched into one compressed map. Nothing here reads any patch or answer file.
-Needs Docker. Takes about 10 to 20 minutes under amd64 emulation.
+Needs Docker. Two passes: one process per shard, then one fork per test (see
+MAP_FORK in map_plugin.py). The map is their union.
 """
 
 from __future__ import annotations
@@ -40,23 +41,25 @@ def shard_files(tests: list[dict], shards: int) -> list[list[str]]:
     return groups
 
 
-def run_shard(index: int, files: list[str], workdir: Path) -> Path:
-    out = workdir / f"shard{index}.json"
+def run_shard(index: int, files: list[str], workdir: Path, fork: bool = False) -> Path:
+    name = f"shard{index}{'f' if fork else ''}"
+    out = workdir / f"{name}.json"
     cmd = [
         "docker", "run", "--rm", "--platform", "linux/amd64", "--network", "none",
         "-v", f"{TOOLS}:/tools:ro", "-v", f"{workdir}:/out",
         "-e", "SKIP_INTEGRATION=0", "-e", "MAP_ROOT=/opt/sqlglot",
-        "-e", f"MAP_OUT=/out/shard{index}.json", "-e", "PYTHONPATH=/tools:/opt/sqlglot",
+        "-e", f"MAP_FORK={1 if fork else 0}",
+        "-e", f"MAP_OUT=/out/{name}.json", "-e", "PYTHONPATH=/tools:/opt/sqlglot",
         "-w", "/opt/sqlglot", IMAGE,
         "python", "-m", "pytest", "-q", "-p", "map_plugin", "-p", "no:cacheprovider",
         "--timeout=600", "-o", "addopts=", *files,
     ]
-    log = workdir / f"shard{index}.log"
+    log = workdir / f"{name}.log"
     with open(log, "w") as fh:
         subprocess.run(cmd, stdout=fh, stderr=subprocess.STDOUT)
     if not out.exists():
-        sys.exit(f"shard {index} wrote no map, see {log}")
-    print(f"shard {index} done: {log.read_text().strip().splitlines()[-1]}", file=sys.stderr)
+        sys.exit(f"shard {name} wrote no map, see {log}")
+    print(f"shard {name} done: {log.read_text().strip().splitlines()[-1]}", file=sys.stderr)
     return out
 
 
@@ -150,21 +153,34 @@ def merge(paths: list[Path], tests: list[dict]) -> dict:
 
 
 def main() -> None:
+    global IMAGE
     ap = argparse.ArgumentParser()
     ap.add_argument("--tests", default=str(ENTRY.parent / "kit" / "sample" / "tests.json"))
     ap.add_argument("--shards", type=int, default=4)
     ap.add_argument("--keep", help="directory to keep raw shard output in")
     ap.add_argument("--merge-only", action="store_true")
+    ap.add_argument("--image", default=IMAGE)
+    ap.add_argument("--no-build", action="store_true")
+    ap.add_argument("--fork-shards", type=int, default=8,
+                    help="shards for the second pass, one fork per test (0 skips it)")
     opts = ap.parse_args()
     tests = json.loads(Path(opts.tests).read_text())["tests"]
 
     workdir = Path(opts.keep) if opts.keep else Path(tempfile.mkdtemp(prefix="blastmap"))
     workdir.mkdir(parents=True, exist_ok=True)
+    IMAGE = opts.image
     if not opts.merge_only:
-        subprocess.run(["docker", "build", "--platform", "linux/amd64", "-t", IMAGE, str(ENTRY)], check=True)
-        groups = shard_files(tests, opts.shards)
-        with ThreadPoolExecutor(len(groups)) as pool:
-            paths = list(pool.map(lambda a: run_shard(a[0], a[1], workdir), enumerate(groups)))
+        if not opts.no_build:
+            subprocess.run(["docker", "build", "--platform", "linux/amd64", "-t", IMAGE, str(ENTRY)], check=True)
+        # Pass 1: one process per shard, as the tests normally run.
+        # Pass 2: every test in its own fork of the collected session, so code
+        # that runs once per process is credited to every test that needs it.
+        # The map is the union of both.
+        jobs = [(i, g, False) for i, g in enumerate(shard_files(tests, opts.shards))]
+        if opts.fork_shards:
+            jobs += [(i, g, True) for i, g in enumerate(shard_files(tests, opts.fork_shards))]
+        with ThreadPoolExecutor(len(jobs)) as pool:
+            paths = list(pool.map(lambda a: run_shard(a[0], a[1], workdir, a[2]), jobs))
     else:
         paths = sorted(workdir.glob("shard*.json"))
     data = merge(paths, tests)

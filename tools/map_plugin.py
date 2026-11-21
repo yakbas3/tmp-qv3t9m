@@ -23,6 +23,8 @@ import pickle
 import pkgutil
 import sys
 
+from firstline import first_line
+
 ROOT = os.path.realpath(os.environ.get("MAP_ROOT", os.getcwd())) + os.sep
 TOOL = 4
 mon = sys.monitoring
@@ -39,6 +41,18 @@ def _line(code, line):
         fn = code.co_filename
         if fn.startswith(ROOT):
             _lines.add((fn, line))
+        return mon.DISABLE
+    except Exception:
+        return None
+
+
+def _start_ev(code, offset):
+    try:
+        fn = code.co_filename
+        if fn.startswith(ROOT):
+            ln = first_line(code)
+            if ln is not None:
+                _lines.add((fn, ln))
         return mon.DISABLE
     except Exception:
         return None
@@ -154,7 +168,8 @@ REC = Recorder()
 def _start():
     mon.use_tool_id(TOOL, "blastmap")
     mon.register_callback(TOOL, mon.events.LINE, _line)
-    mon.set_events(TOOL, mon.events.LINE)
+    mon.register_callback(TOOL, mon.events.PY_START, _start_ev)
+    mon.set_events(TOOL, mon.events.LINE | mon.events.PY_START)
     sys.addaudithook(_audit)
     builtins.__build_class__ = _build_class
     concurrent.futures.ProcessPoolExecutor = _SyncPool
@@ -213,6 +228,89 @@ def pytest_runtest_teardown(item):
     REC.switch(f"teardown:{item.nodeid}")
 
 
+FORK = os.environ.get("MAP_FORK") == "1"
+
+
+@pytest.hookimpl(tryfirst=True)
+def pytest_runtest_protocol(item, nextitem):
+    """With MAP_FORK=1, run each test in a fork of the collected session.
+
+    Code that runs once per process (functools caches, class-level memo
+    tables, dispatch maps built on first use) is otherwise credited only to
+    the first test that triggers it. A fork starts every test from the state
+    right after collection, so each test is credited with all the run-once
+    code it depends on. Session, module and class fixtures rerun per fork.
+    """
+    if not FORK:
+        return None
+    from _pytest.runner import runtestprotocol
+
+    REC.switch("other")
+    config = item.config
+    item.ihook.pytest_runtest_logstart(nodeid=item.nodeid, location=item.location)
+    rfd, wfd = os.pipe()
+    pid = os.fork()
+    if pid == 0:
+        os.close(rfd)
+        code = 0
+        try:
+            REC.buckets = {}
+            config.__dict__["_map_outcomes"] = {}
+            reports = runtestprotocol(item, nextitem=None, log=False)
+            REC.switch("other")
+            buckets = {}
+            for key, b in REC.buckets.items():
+                if key == "other":
+                    continue
+                buckets[key] = {
+                    "lines": b["lines"], "files": b["files"], "dirs": b["dirs"],
+                    "type_keys": _type_keys(b["types"]), "spawn": b["spawn"],
+                }
+            payload = {
+                "buckets": buckets,
+                "outcomes": config.__dict__.get("_map_outcomes", {}),
+                "reports": [config.hook.pytest_report_to_serializable(config=config, report=r) for r in reports],
+            }
+            data = pickle.dumps(payload)
+            with os.fdopen(wfd, "wb") as fh:
+                fh.write(data)
+        except BaseException:  # noqa: BLE001
+            import traceback
+
+            traceback.print_exc()
+            code = 1
+        finally:
+            os._exit(code)
+    os.close(wfd)
+    with os.fdopen(rfd, "rb") as fh:
+        data = fh.read()
+    os.waitpid(pid, 0)
+    outcomes = config.__dict__.setdefault("_map_outcomes", {})
+    if not data:
+        outcomes[item.nodeid] = "failed"
+        print(f"map: fork for {item.nodeid} sent nothing", file=sys.stderr)
+    else:
+        payload = pickle.loads(data)
+        for key, cb in payload["buckets"].items():
+            b = REC.buckets.setdefault(key, {"lines": set(), "files": set(), "dirs": set(), "types": set(), "spawn": False})
+            b["lines"] |= cb["lines"]
+            b["files"] |= cb["files"]
+            b["dirs"] |= cb["dirs"]
+            b.setdefault("type_keys", set()).update(cb["type_keys"])
+            b["spawn"] = b["spawn"] or cb["spawn"]
+        for nid, o in payload["outcomes"].items():
+            if o == "failed":
+                outcomes[nid] = "failed"
+            else:
+                outcomes.setdefault(nid, o)
+        # the child ran with log=False: replay its setup/call/teardown reports
+        for r in payload["reports"]:
+            rep = config.hook.pytest_report_from_serializable(config=config, data=r)
+            item.ihook.pytest_runtest_logreport(report=rep)
+    item.ihook.pytest_runtest_logfinish(nodeid=item.nodeid, location=item.location)
+    return True
+
+
 def _type_keys(types):
     keys = set()
     for t in types:
@@ -236,7 +334,7 @@ def pytest_sessionfinish(session):
             "lines": {k: sorted(v) for k, v in lines.items()},
             "files": sorted(os.path.relpath(p, ROOT) for p in b["files"]),
             "dirs": sorted(os.path.relpath(p, ROOT) for p in b["dirs"]),
-            "types": sorted(_type_keys(b["types"])),
+            "types": sorted(_type_keys(b["types"]) | b.get("type_keys", set())),
             "spawn": b["spawn"],
         }
     outcomes = getattr(session.config, "_map_outcomes", {})

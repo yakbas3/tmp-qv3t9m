@@ -29,6 +29,8 @@ import os
 import sys
 import threading
 
+from firstline import first_line
+
 ROOT = os.path.realpath(os.environ.get("MAP_ROOT", os.getcwd())) + os.sep
 OUT = os.environ.get("RCOV_OUT", "/out/rcov.json")
 TOOL = 3
@@ -54,13 +56,28 @@ def _line(code, line):
         return None
 
 
+def _start_ev(code, offset):
+    try:
+        if _paused():
+            return None
+        fn = code.co_filename
+        if fn.startswith(ROOT):
+            ln = first_line(code)
+            if ln is not None:
+                _lines.add((fn[len(ROOT):], ln))
+        return mon.DISABLE
+    except Exception:
+        return None
+
+
 def _install():
     try:
         mon.use_tool_id(TOOL, "rcov")
     except ValueError:
         return
     mon.register_callback(TOOL, mon.events.LINE, _line)
-    mon.set_events(TOOL, mon.events.LINE)
+    mon.register_callback(TOOL, mon.events.PY_START, _start_ev)
+    mon.set_events(TOOL, mon.events.LINE | mon.events.PY_START)
 
 
 def front(fn):
