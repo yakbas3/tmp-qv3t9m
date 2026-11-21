@@ -14,8 +14,10 @@ shared_state() reads the AST diff and fires, for the whole patch, when:
      body writes state that outlives the call: a store, delete or mutating
      call on an object that is not local to the call (a global name, an
      imported module, cls, type(x), x.__class__, a class-level table
-     reached through any object), a `global` store, setattr, an import
-     with a computed module name, sys.modules. Whole function on purpose:
+     reached through any object, self.x bound to such an object or
+     assigned only in the class body, self in a metaclass), a `global`
+     store, setattr, an import with a computed module name, sys.modules,
+     a process-wide setter. Whole function on purpose:
      a changed line can steer an unchanged write.
   2. module-level changed code writes through an import-bound name.
   3. the changed code stops copying an object (x.copy(), dict(x), {**x},
@@ -63,7 +65,7 @@ _SETTERS = {
 _STR_ONLY = {"replace"}  # also a str method: only counted on class-level objects
 _COPY_CALLS = {"dict", "list", "set", "frozenset", "tuple", "sorted", "deepcopy", "maybe_copy", "OrderedDict"}
 _VIEWS = {"get", "values", "items", "keys", "setdefault", "__getitem__"}
-_CLS_NAMES = {"cls", "mcs", "mcls", "metacls"}
+_CLS_NAMES = {"cls", "klass", "mcs", "mcls", "metacls"}
 _CACHE_WORD = re.compile(r"cache|memo|singleton|once", re.I)
 _FRESH = (ast.Dict, ast.List, ast.Set, ast.Tuple, ast.DictComp, ast.ListComp, ast.SetComp, ast.GeneratorExp,
           ast.Constant, ast.JoinedStr)
@@ -174,6 +176,8 @@ class _Env:
         self.shared: set = set()  # import-bound, `global`, or a local bound to a shared object
         self.globals: set = set()
         self.cls: set = set()
+        self.self_shared: set = set()  # x in self.x bound to a shared object
+        self.state = lambda x: False  # x in self.x is class state
 
     def absorb(self, nodes):
         """Add the bindings made anywhere under the nodes."""
@@ -184,7 +188,10 @@ class _Env:
                 for p in params:
                     self.local.add(p.arg)
                 first = (a.posonlyargs + a.args)[:1]
-                if first and first[0].arg in _CLS_NAMES:
+                if first and (first[0].arg in _CLS_NAMES or isinstance(n, _DEFS) and (
+                        n.name == "__init_subclass__" or any(
+                            _is_plain(d, "classmethod") or isinstance(d, ast.Attribute) and d.attr == "classmethod"
+                            for d in n.decorator_list))):
                     self.cls.add(first[0].arg)
                 if isinstance(n, _DEFS):
                     self.local.add(n.name)
@@ -217,6 +224,10 @@ class _Env:
                         self.local.discard(t.id)
                         self.shared.add(t.id)
                         grew = True
+                    elif isinstance(t, ast.Attribute) and _is_plain(t.value, "self") and v is not None \
+                            and t.attr not in self.self_shared and self.shared_obj(v, bind=True):
+                        self.self_shared.add(t.attr)
+                        grew = True
             if not grew:
                 break
 
@@ -242,6 +253,8 @@ class _Env:
                 return not bind or bool(attrs) or n in self.globals
             if n in self.cls:
                 return not self.tests and not bind
+            if n == "self" and attrs and attrs[0] is not None and (attrs[0] in self.self_shared or self.state(attrs[0])):
+                return True
             if n in self.local or n == "self":
                 return False
             if bind:
@@ -286,7 +299,9 @@ def _write_of(n, env: _Env):
                 return f"call {_show(f)}"
             if f.attr in _SETTERS and not env.module_level:
                 base, _a = _chain(f.value)
-                if isinstance(base, ast.Name) and base.id not in env.local and base.id != "self":
+                while isinstance(base, ast.Call):  # logging.getLogger(...).setLevel(...)
+                    base, _a = _chain(base.func)
+                if isinstance(base, ast.Name) and base.id not in env.local and base.id not in ("self", "super"):
                     return f"call {_show(f)}"
             if f.attr in ("import_module", "__import__") and not (
                     n.args and isinstance(n.args[0], ast.Constant)):
@@ -297,7 +312,7 @@ def _write_of(n, env: _Env):
                 if env.module_level:
                     if env.shared_obj(a0):
                         return f"{f.id} {_show(a0)}"
-                elif not _is_plain(a0, "self") and not (env.tests and isinstance(a0, ast.Name) and a0.id in env.cls):
+                elif not (_is_plain(a0, "self") and "self" not in env.cls) and not (env.tests and isinstance(a0, ast.Name) and a0.id in env.cls):
                     if env.shared_obj(a0) or not isinstance(a0, ast.Name):
                         return f"{f.id} {_show(a0)}"
             if f.id in ("globals", "exec"):
@@ -308,6 +323,12 @@ def _write_of(n, env: _Env):
     if isinstance(n, ast.Attribute) and n.attr == "modules" and _is_plain(n.value, "sys"):
         return "sys.modules"
     return None
+
+
+def _say(who: str, what: str, w: str) -> str:
+    if w == "sys.modules":  # a read of it already makes the outcome depend on earlier imports
+        what = "reads or writes import state"
+    return f"{who} {what} ({w})"
 
 
 def _writes(nodes, env: _Env) -> list:
@@ -355,8 +376,11 @@ def _copies(nodes) -> list:
                     out.append(f.value)
                 elif n.args:
                     out.append(n.args[0])
-            elif isinstance(f, ast.Name) and f.id in _COPY_CALLS and n.args:
-                out.append(n.args[0])
+            elif isinstance(f, ast.Name) and f.id in _COPY_CALLS:
+                if n.args:
+                    out.append(n.args[0])
+                if f.id in ("dict", "OrderedDict"):  # dict(ENV, **env) copies both
+                    out.extend(k.value for k in n.keywords if k.arg is None)
             elif isinstance(f, ast.Name) and f.id == "copy" and n.args:
                 out.append(n.args[0])
         elif isinstance(n, ast.Dict):
@@ -493,15 +517,80 @@ def _stmts(nodes) -> list:
     return [x if isinstance(x, ast.stmt) else ast.Expr(x) for x in nodes if isinstance(x, ast.AST)]
 
 
-def _func_check(fn, extra: list, tests: bool, rel: str):
+_META_BASES = {"type", "ABCMeta", "EnumMeta", "EnumType"}
+
+
+class _Classes:
+    """The classes of one file, old and new tree. state(method, x): x is
+    assigned in the class body and never stored on self anywhere in that
+    class, so self.x is the one object all instances share. The self
+    stores are collected only when a class-body name is asked about."""
+
+    def __init__(self, trees):
+        self.nodes: dict = {}  # qualified name -> ClassDef nodes
+        self.body: dict = {}
+        self.bases: dict = {}
+        self.owner: dict = {}  # id(method) -> qualified name
+        self.stored: dict = {}
+        for tree in trees:
+            self._visit(tree.body, ())
+        meta = {q for q, b in self.bases.items() if b & _META_BASES}
+        while True:
+            more = {q for q, b in self.bases.items() if q not in meta and b & {m[-1] for m in meta}}
+            if not more:
+                break
+            meta |= more
+        self.meta = meta
+
+    def _visit(self, stmts, qual):
+        for st in stmts:
+            if not isinstance(st, ast.ClassDef):
+                continue
+            q = qual + (st.name,)
+            self.nodes.setdefault(q, []).append(st)
+            self.bases.setdefault(q, set()).update(
+                b.id if isinstance(b, ast.Name) else b.attr for b in st.bases if isinstance(b, (ast.Name, ast.Attribute)))
+            names = self.body.setdefault(q, set())
+            if not any("dataclass" in ast.dump(d) for d in st.decorator_list):  # fields are per instance
+                for x in st.body:
+                    if isinstance(x, (ast.Assign, ast.AnnAssign)):
+                        names.update(t.id for t, _v, _a in _stores(x) if isinstance(t, ast.Name))
+            self.owner.update((id(x), q) for x in st.body if isinstance(x, _DEFS))
+            self._visit(st.body, q)
+
+    def is_meta(self, fn) -> bool:
+        return self.owner.get(id(fn)) in self.meta
+
+    def state(self, fn, x: str) -> bool:
+        q = self.owner.get(id(fn))
+        if q is None or x not in self.body[q]:
+            return False
+        mine = self.stored.get(q)
+        if mine is None:
+            mine = self.stored[q] = set()
+            for c in self.nodes[q]:
+                for n in ast.walk(c):
+                    if isinstance(n, ast.Attribute) and _is_plain(n.value, "self") and isinstance(n.ctx, (ast.Store, ast.Del)):
+                        mine.add(n.attr)
+                    elif isinstance(n, ast.Call) and _is_plain(n.func, "setattr") and n.args and _is_plain(n.args[0], "self"):
+                        a1 = n.args[1] if len(n.args) > 1 else None
+                        mine.add(a1.value if isinstance(a1, ast.Constant) and isinstance(a1.value, str) else None)
+        return x not in mine and None not in mine
+
+
+def _func_check(fn, extra: list, tests: bool, rel: str, info=None):
     """Whole-function check. fn is the old version; with the patched
     statements added it stands for the old and the new version together."""
     env = _Env(tests)
+    if info is not None:
+        env.state = lambda x: info.state(fn, x)
+        if info.is_meta(fn):
+            env.cls.add("self")  # self in a metaclass is the class
     env.absorb([fn] + extra)
     env.alias([fn] + extra)
     ws = _writes([fn] + extra, env)
     if ws:
-        return f"changed function writes shared state ({ws[0][1]})"
+        return _say("changed function", "writes shared state", ws[0][1])
     ref = _registry_ref([fn] + extra, rel)
     if ref:
         return f"changed function uses {ref}"
@@ -531,6 +620,7 @@ def _shared_state(rel, old_tree, new_tree, sites, tests):
             for al in n.names:
                 module_env.shared.add((al.asname or al.name).split(".")[0])
 
+    info = _Classes((old_tree, new_tree))
     by_func: dict = {}
     for site in sites:
         old_nodes = [] if site.kind == "insert" else list(site.nodes)
@@ -548,7 +638,7 @@ def _shared_state(rel, old_tree, new_tree, sites, tests):
             nested = {id(x) for f in inner for x in _w(f) if x is not f}
             outer = [f for f in inner if id(f) not in nested]
             for f in outer:
-                why = _func_check(f, [], tests, rel)
+                why = _func_check(f, [], tests, rel, info)
                 if why:
                     return why
             skip = {id(x) for f in outer for x in _w(f)}
@@ -557,7 +647,7 @@ def _shared_state(rel, old_tree, new_tree, sites, tests):
                     continue
                 w = _write_of(n, module_env)
                 if w:
-                    return f"import-time code writes another module's state ({w})"
+                    return _say("import-time code", "writes another module's state", w)
             if not isinstance(st, _DEFS + (ast.ClassDef,)):
                 ref = _registry_ref([st], rel)
                 if ref:
@@ -573,7 +663,7 @@ def _shared_state(rel, old_tree, new_tree, sites, tests):
                 return cd[0]
 
     for fn, old_nodes, new_nodes in by_func.values():
-        why = _func_check(fn, _stmts(new_nodes), tests, rel)
+        why = _func_check(fn, _stmts(new_nodes), tests, rel, info)
         if why:
             return why
         cd = _copy_drop(_stmts(old_nodes), _stmts(new_nodes))
