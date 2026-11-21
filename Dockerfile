@@ -23,6 +23,7 @@ RUN cd /opt/sqlglot && PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python -m pytest --colle
 COPY app /app
 RUN python /app/selector.py --build-index \
  && cd /opt/sqlglot && PYTHONPATH=/opt/sqlglot python /app/proxy.py --baseline /app/proxy_base.json \
+ && PYTHONPATH=/opt/sqlglot python /app/impfp.py --baseline /app/impfp_base.json \
  && python -m compileall -q /app && chmod -R a+rX /app
 
 ENV SKIP_INTEGRATION=0 PYTHONUNBUFFERED=1
