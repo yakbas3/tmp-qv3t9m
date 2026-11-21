@@ -32,6 +32,7 @@ TMP = os.environ.get("BLAST_TMP", "/tmp")
 WORKER_MS = 2000
 MAX_WORKERS = 8
 PARALLEL = 2
+PROXY_MIN_MS = 3000  # tests cheaper than this are not worth the proxy run
 
 CONFIG_FILES = {"pyproject.toml", "setup.cfg", "pytest.ini", "tox.ini", "conftest.py", "setup.py"}
 
@@ -542,15 +543,18 @@ class Analysis:
         self.patched: dict = {}  # rel path -> new text or None (deleted)
         self.applied = True
         self.sqlglot_modules: list = []  # changed importable sqlglot modules
+        self.rsafe = True  # every change is a function body the proxy covers
 
 
 class Analyzer:
-    def __init__(self, mp: Map, index: dict):
+    def __init__(self, mp: Map, index: dict, rlines: dict | None = None):
         self.mp = mp
         self.importers = index["importers"]
         self.refs = index.get("refs", {})
         self.strings = set(index.get("strings", []))
         self._module_rule: dict = {}
+        # lines the TPC executor tests run outside the proxied front end
+        self.rlines = rlines
 
     # rules -------------------------------------------------------------
     def module_rule(self, rel: str) -> int:
@@ -596,6 +600,34 @@ class Analyzer:
                 if ob is not None:
                     b |= ob
         return b
+
+    def site_spans(self, site: Site) -> list:
+        spans = []
+        if site.kind == "insert":
+            if site.prev is not None:
+                spans.append(_span(site.prev))
+            elif site.next is not None:
+                spans.append(_span(site.next))
+            p = site.parent
+            if p is not None and hasattr(p, "lineno") and not isinstance(p, SCOPED + (ast.Lambda,)):
+                # the header of an if/for/while/with/try reaching this block;
+                # a def line runs at import, its body is what the tests reach
+                spans.append((p.lineno, p.lineno))
+            if site.prev is None and site.next is None and p is not None and hasattr(p, "lineno"):
+                spans.append(_span(p))
+        else:
+            for n in site.nodes:
+                spans.append(_span(n))
+        return spans
+
+    def r_hit(self, rel: str, site: Site) -> bool:
+        """Whether the TPC tests may reach this change outside the front end."""
+        if self.rlines is None:
+            return True
+        lines = self.rlines.get(rel)
+        if not lines:
+            return False
+        return any(l in lines for lo, hi in self.site_spans(site) for l in range(lo, hi + 1))
 
     def import_dependents(self, site: Site) -> int:
         """Modules that read the changed names at import time (class bodies like
@@ -661,22 +693,7 @@ class Analyzer:
     def func_rule(self, rel: str, site: Site) -> tuple[int, bool]:
         """Tests reaching the changed statements; flag if the code runs at import."""
         mp = self.mp
-        spans = []
-        if site.kind == "insert":
-            if site.prev is not None:
-                spans.append(_span(site.prev))
-            elif site.next is not None:
-                spans.append(_span(site.next))
-            p = site.parent
-            if p is not None and hasattr(p, "lineno") and not isinstance(p, SCOPED + (ast.Lambda,)):
-                # the header of an if/for/while/with/try reaching this block;
-                # a def line runs at import, its body is what the tests reach
-                spans.append((p.lineno, p.lineno))
-            if site.prev is None and site.next is None and p is not None and hasattr(p, "lineno"):
-                spans.append(_span(p))
-        else:
-            for n in site.nodes:
-                spans.append(_span(n))
+        spans = self.site_spans(site)
         b = 0
         at_import = False
         for lo, hi in spans:
@@ -720,6 +737,9 @@ class Analyzer:
         mp = self.mp
         old_rel, new_rel = fd.old, fd.new
         rel = old_rel or new_rel
+        if fd.binary or old_rel != new_rel or not (rel or "").startswith("sqlglot/") \
+                or not rel.endswith(".py"):
+            a.rsafe = False
         if fd.binary:
             a.full = True
             a.applied = False
@@ -813,6 +833,7 @@ class Analyzer:
             a.sqlglot_modules.append(module_name(rel))
         if old_text != new_text and _encoding_cookie(old_text) != _encoding_cookie(new_text):
             a.cand |= self.module_rule(rel)
+            a.rsafe = False
         sites = diff_ast(old_tree, new_tree)
         if not sites:
             a.reasons.append(f"no-op {rel}")
@@ -824,6 +845,11 @@ class Analyzer:
             if in_func:
                 b, at_import = self.func_rule(rel, site)
                 a.cand |= b
+                if at_import or self.r_hit(rel, site):
+                    a.rsafe = False
+            elif not (site.kind == "insert" and not scope and _new_unused_defs(site.nodes, old_text)):
+                a.rsafe = False
+            if in_func:
                 if at_import:
                     a.cand |= self.module_rule(rel)
                     a.reasons.append(f"import-time code {rel}")
@@ -1081,19 +1107,30 @@ def child_verify(job: dict, out_path: str):
             except BaseException as e:  # noqa: BLE001
                 result = {"import_error": f"{mod}: {type(e).__name__}: {e}"}
                 raise SystemExit
-        import pytest
-
-        col = _Collector(job["limits"])
-        args = list(job["ids"]) + [
-            "-q", "--tb=no", "-p", "no:cacheprovider", "-p", "no:randomly", "-o", "addopts=",
-            "--rootdir", farm, "-o", "python_files=test_*.py",
-        ]
-        rc = pytest.main(args, plugins=[col])
         failed = set()
-        for nid in job["ids"]:
-            if nid in col.failed or nid not in col.seen:
-                failed.add(nid)
+        rc = 0
+        if job["ids"]:
+            import pytest
+
+            col = _Collector(job["limits"])
+            args = list(job["ids"]) + [
+                "-q", "--tb=no", "-p", "no:cacheprovider", "-p", "no:randomly", "-o", "addopts=",
+                "--rootdir", farm, "-o", "python_files=test_*.py",
+            ]
+            rc = pytest.main(args, plugins=[col])
+            for nid in job["ids"]:
+                if nid in col.failed or nid not in col.seen:
+                    failed.add(nid)
         result = {"failed": sorted(failed), "rc": int(rc)}
+        if job.get("proxy"):
+            # after pytest, so the proxy cannot change what the tests saw
+            result["proxy_ok"] = []
+            sys.path.insert(1, APP)
+            import proxy
+
+            for tid in job["proxy"]:
+                if proxy.check(tid, job["proxy_base"].get(tid)):
+                    result["proxy_ok"].append(tid)
     except SystemExit:
         pass
     except BaseException as e:  # noqa: BLE001
@@ -1200,7 +1237,15 @@ def main():
     try:
         mp = Map(os.path.join(APP, "map.json.gz"), tests)
         index = json.load(open(os.path.join(APP, "index.json")))
-        an = Analyzer(mp, index)
+        rlines = None
+        proxy_base: dict = {}
+        try:
+            raw = json.loads(gzip.decompress(open(os.path.join(APP, "rcov.json.gz"), "rb").read()))
+            proxy_base = json.load(open(os.path.join(APP, "proxy_base.json")))
+            rlines = {f: set(v) for f, v in raw.items()}
+        except Exception as e:  # noqa: BLE001
+            log(f"proxy unavailable ({e})")
+        an = Analyzer(mp, index, rlines)
     except Exception as e:  # noqa: BLE001
         log(f"map unavailable ({e}); selecting everything")
         everything = list(range(n))
@@ -1233,17 +1278,44 @@ def main():
     file_cpu = {"tests/test_optimizer.py": 1.4, "tests/test_executor.py": 1.8}
     test_factor = {"tests/test_optimizer.py": 2.5, "tests/test_executor.py": 2.0}
     p_pass = 0.45  # prior that a verified candidate set holds no failure
+    # The model above was timed under local amd64 emulation. The board's
+    # native CPU reads about half of that, so scale the charge down.
+    cpu_scale = float(os.environ.get("BLAST_CPU_SCALE", "0.5"))
+    num_of_id = {v: k for k, v in ids.items()}
+    base_failed = set(mp.m.get("base_failed", []))
+    proxy_nums = {num_of_id[tid]: tid for tid in proxy_base
+                  if tid in num_of_id and proxy_base[tid] and tid not in base_failed}
     for c in commits:
         a = analyses[c]
         cand = bits_list(a.cand)
         base_cost = pack_cost(cand, dur)
-        plan[c] = {"verify": [], "keep": cand}
+        plan[c] = {"verify": [], "keep": cand, "proxy": []}
+        px = []
+        if a.rsafe and not a.full and a.applied and verify_on:
+            px = [t for t in cand if t in proxy_nums and dur[t] >= PROXY_MIN_MS]
+        if px:
+            cand = [t for t in cand if t not in px]
+            base_cost = pack_cost(cand, dur)
+            plan[c]["keep"] = cand
+            plan[c]["proxy"] = px
+            jobs.append({
+                "commit": c, "ids": [], "limits": {}, "secs": [],
+                "patched": a.patched,
+                "modules": [m for m in a.sqlglot_modules if m],
+                "proxy": [proxy_nums[t] for t in px],
+                "proxy_base": {proxy_nums[t]: proxy_base[proxy_nums[t]] for t in px},
+                "gain": sum(dur[t] for t in px),
+                "est_wall": 1.5 + 0.25 * sum(secs[t] for t in px),
+                "max_wall": 30.0 + 1.0 * sum(secs[t] for t in px),
+            })
+            log(f"{c}: proxy {len(px)} ({sum(secs[t] for t in px):.1f}s)")
         if not cand or a.full or not a.applied or not verify_on:
             log(f"{c}: {len(cand)} cand, cost {base_cost / 1000:.1f}s, no verify {a.reasons[:3]}")
             continue
         # pick a duration threshold: verify everything at or below it
         order = sorted(cand, key=lambda t: dur[t])
-        best = (base_cost, -1)
+        # demand a margin: the CPU model is rough, a tie is a likely loss
+        best = (base_cost - 250, -1)
         files: set = set()
         cpu = per_run_cpu
         for k, t in enumerate(order):
@@ -1258,7 +1330,7 @@ def main():
             biggest = order[k]
             if_pass = pack_cost(rest, dur)
             if_fail = pack_cost(rest + [biggest], dur)
-            est = cpu * 1000 + p_pass * if_pass + (1 - p_pass) * if_fail
+            est = cpu * cpu_scale * 1000 + p_pass * if_pass + (1 - p_pass) * if_fail
             if est < best[0]:
                 best = (est, k)
         if os.environ.get("BLAST_FORCE") == "1":
@@ -1268,9 +1340,10 @@ def main():
             continue
         v = order[: best[1] + 1]
         keep = order[best[1] + 1:]
-        plan[c] = {"verify": v, "keep": keep}
+        plan[c]["verify"] = v
+        plan[c]["keep"] = keep
         vsec = sum(secs[t] for t in v)
-        jobs.append({
+        job = {
             "commit": c,
             "ids": [ids[t] for t in v],
             "limits": {ids[t]: 15.0 + 6.0 * secs[t] for t in v},
@@ -1280,7 +1353,16 @@ def main():
             "secs": [secs[t] for t in v],
             "est_wall": 1.5 + vsec * 1.6,
             "max_wall": 20.0 + vsec * 4.0,
-        })
+        }
+        if plan[c]["proxy"]:
+            # one child does both: the tests, then the proxy
+            pj = jobs.pop()
+            job["proxy"] = pj["proxy"]
+            job["proxy_base"] = pj["proxy_base"]
+            job["gain"] += pj["gain"]
+            job["est_wall"] += pj["est_wall"]
+            job["max_wall"] += pj["max_wall"]
+        jobs.append(job)
         log(f"{c}: {len(cand)} cand, cost {base_cost / 1000:.1f}s, verify {len(v)} ({vsec:.1f}s), "
             f"keep {len(keep)}, est {best[0] / 1000:.1f}s {a.reasons[:2]}")
 
@@ -1298,8 +1380,17 @@ def main():
         a = analyses[c]
         p = plan[c]
         out = set(p["keep"])
+        res = results.get(c)
+        if p["proxy"]:
+            ok = set(res.get("proxy_ok", [])) if res and "failed" in res else set()
+            for t in p["proxy"]:
+                if ids[t] not in ok:
+                    out.add(t)
+            log(f"{c}: proxy cleared {len(ok)} of {len(p['proxy'])}")
+            if res and "import_error" in res:
+                log(f"{c}: patched sqlglot does not import: {res['import_error']}")
+                out = set(range(n))
         if p["verify"]:
-            res = results.get(c)
             if res is None or "failed" not in res:
                 if res and "import_error" in res:
                     log(f"{c}: patched sqlglot does not import: {res['import_error']}")

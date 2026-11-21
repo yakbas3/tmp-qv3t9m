@@ -21,7 +21,9 @@ RUN cd /opt/sqlglot && PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python -m pytest --colle
       -p no:cacheprovider tests > /dev/null && chmod -R a+rX /opt/sqlglot
 
 COPY app /app
-RUN python /app/selector.py --build-index && python -m compileall -q /app && chmod -R a+rX /app
+RUN python /app/selector.py --build-index \
+ && cd /opt/sqlglot && PYTHONPATH=/opt/sqlglot python /app/proxy.py --baseline /app/proxy_base.json \
+ && python -m compileall -q /app && chmod -R a+rX /app
 
 ENV SKIP_INTEGRATION=0 PYTHONUNBUFFERED=1
 CMD ["python", "/app/selector.py"]
