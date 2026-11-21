@@ -581,64 +581,6 @@ def check_tpcds(base: list, need=(), costs=None, budget: float = 0.0, info: dict
     return True
 
 
-def risk_tpcds(base: list, order, budget: float, costs, fcosts, info: dict | None = None) -> bool:
-    """Not a proof: the risk dial (BLAST_TPCDS_RISK in selector.py). Takes
-    the TPC-DS queries in `order`, recomputes each front end and runs each
-    executed query, until `budget` CPU seconds are spent. False at the first
-    sign the test fails (a changed fixture pair or test-process digest, a
-    query the worker would now execute or no longer can send, a different
-    table, a raise, a loop); True when the budget runs out, or the order
-    ends, without one. A worker digest that differs is no sign by itself:
-    a changed plan may still return the pinned table."""
-    import time
-
-    info = {} if info is None else info
-    t0 = time.process_time()
-
-    def stop(why):
-        info["risk_stop"] = why
-        info["risk_cpu"] = round(time.process_time() - t0, 2)
-        return False
-
-    if not setup_ok():
-        return stop("setup")
-    rp = Replay()
-    if len(base) != len(rp.pairs) or any(len(b) != 4 for b in base):
-        return stop("pairs")
-    for i in range(len(rp.pairs)):
-        if rp.pair(i) != base[i][3]:
-            return stop(f"pair {i}")
-    info["risk_ran"] = []
-    for i in order:
-        if time.process_time() - t0 >= budget:
-            break
-        b_main, b_worker, b_table, _b_pair = base[i]
-        with _limit(5.0 * (float(fcosts[i]) if fcosts else 1.0) + 0.5):
-            main, worker, blob = rp.front(i)
-        if main != b_main:
-            return stop(f"main {i}")
-        if b_worker is None:
-            if worker is not None:
-                return stop(f"worker {i}")
-            continue
-        if blob is None or b_table is None:
-            return stop(f"worker {i}")
-        info["risk_ran"].append(i)
-        with _limit(3.0 * (float(costs[i]) if costs else 1.0) + 1.0):
-            got = rp.back(blob)
-        if got != b_table:
-            return stop(f"table {i}")
-        if not rp.intact():
-            return stop(f"shared tables {i}")
-    info["risk_cpu"] = round(time.process_time() - t0, 2)
-    return True
-
-
-# check_tpcds stops that say nothing about the outcome: the check ran out
-# of budget, not into a difference
-NO_EVIDENCE = ("budget", "cap", "projected", "risk only")
-
-
 def baseline() -> dict:
     sys.setrecursionlimit(max(sys.getrecursionlimit(), 20000))
     out = {}

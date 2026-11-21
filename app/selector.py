@@ -46,28 +46,12 @@ TPCDS_ID = "tests/test_executor.py::TestExecutor::test_execute_tpcds"
 # run pays off only when the test is then cleared, which is no better than
 # an even bet, and the test costs 21 s when kept.
 REPLAY_BUDGET = float(os.environ.get("BLAST_REPLAY_BUDGET", "8.0"))
-# The risk dial, off by default. When above 0, a test_execute_tpcds that no
-# proof clears gets a sampled replay of up to this many CPU seconds
-# (proxy.risk_tpcds, queries in risk_order): no sign of failure in the
-# sample and the test is left out. Not a proof: a failure that shows only in
-# queries the sample did not reach is missed.
-RISK_BUDGET = float(os.environ.get("BLAST_TPCDS_RISK", "0"))
-RISK_ORDER = os.environ.get("BLAST_TPCDS_RISK_ORDER", "targeted")
-# Off by default, not a proof: test_max_nodes (29 s) checked by a stand-in
-# that runs its body at 1/25 scale (max_nodes_standin).
-STANDIN_ON = os.environ.get("BLAST_STANDIN", "0") == "1"
-MAXNODES_ID = "tests/test_parser.py::TestParser::test_max_nodes"
-STANDIN_CPU = 1.5  # what the stand-in costs on the pinned tree, CPU s
 # Off: r_class does not yet follow a class attribute read through a class
 # object (self.dialect.tokenizer_class.NUMERIC_ESCAPES, cls.TRANSFORMS), so
 # it can clear a TPC test that reads the change.
 R_CLASS_ON = os.environ.get("BLAST_R_CLASS") == "1"
 # fixture files test_execute_tpcds reads: setUpClass loads both, the test
 # uses the TPC-DS pairs' meta and SQL
-# the tests proxy.py replays
-TPC_IDS = ("tests/test_executor.py::TestExecutor::test_execute_tpcds",
-           "tests/test_executor.py::TestExecutor::test_execute_tpch",
-           "tests/test_executor.py::TestExecutor::test_optimized_tpch")
 TPC_FIXTURES = {"tests/fixtures/optimizer/tpc-ds/tpc-ds.sql", "tests/fixtures/optimizer/tpc-h/tpc-h.sql"}
 
 CONFIG_FILES = {"pyproject.toml", "setup.cfg", "pytest.ini", "tox.ini", "conftest.py", "setup.py",
@@ -454,93 +438,6 @@ class RQ:
 
     def queries(self, bits: int) -> list:
         return [i for i in range(self.nq) if bits >> i & 1]
-
-
-def max_nodes_standin(width: int = 400, slow: float = 4.0) -> bool:
-    """test_parser.py::TestParser::test_max_nodes at width/10000 of its
-    size, the node limits scaled with it (1,000,000 and 50,000 nodes for
-    10,000 columns become 100 and 5 per column). Same statements, same
-    depth (100), same messages; a fifth of a second of tokenizing instead
-    of 12. Fails on any assertion, and when it takes over `slow` CPU
-    seconds (2.5 times the pinned tree): the real test parses 25 times as
-    much and could time out. Not a proof (see the report): a change that
-    shows only past this size passes here."""
-    import resource
-
-    from sqlglot import exp, parse_one
-    from sqlglot.errors import ParseError
-
-    def cpu():
-        r = resource.getrusage(resource.RUSAGE_SELF)
-        return r.ru_utime + r.ru_stime
-
-    c0 = cpu()
-    try:
-        if not isinstance(parse_one("SELECT 1", max_nodes=1_000_000), exp.Select):
-            return False
-        cols = [f"col{i}" for i in range(500)]
-        if not isinstance(parse_one(f"SELECT {','.join(cols)} FROM t", max_nodes=1_000_000), exp.Select):
-            return False
-        expr = "x" + "=x" * 100
-        sql = f"SELECT {','.join([expr] * width)}"
-        for lim in (100 * width, 5 * width):
-            try:
-                parse_one(sql, max_nodes=lim)
-                return False
-            except ParseError as e:
-                if "Maximum number of AST nodes" not in str(e) or f"({lim})" not in str(e):
-                    return False
-        try:
-            parse_one("SELECT " + ",".join(f"x={i}" for i in range(100)), max_nodes=5)
-            return False
-        except ParseError:
-            pass
-        if not isinstance(parse_one("SELECT 1, 2, 3"), exp.Select):
-            return False
-    except BaseException:  # noqa: BLE001
-        return False
-    return cpu() - c0 <= slow
-
-
-_DIVERSE: dict = {}
-
-
-def risk_order(rq: RQ, need, front, kind: str = "targeted") -> list:
-    """TPC-DS queries in the order the risk dial samples them. "cheap":
-    cheapest front end and run first. "diverse": greedy, the query whose
-    run and front end reach the most lines no earlier query reached, per
-    CPU second. "targeted": the queries whose run reaches a change (need),
-    then those whose front end may (front, None for every one), each
-    cheapest first, then the rest in the diverse order."""
-    n = rq.nq
-    price = [rq.cost[i] + rq.fcost[i] + 0.01 for i in range(n)]
-    if kind == "cheap":
-        return sorted(range(n), key=lambda i: (price[i], i))
-    div = _DIVERSE.get(id(rq))
-    if div is None:
-        cover: list = [set() for _ in range(n)]
-        for src in (rq.lines, rq.front or {}):
-            for f, (lns, bits) in src.items():
-                for ln, b in zip(lns, bits):
-                    for i in range(n):
-                        if b >> i & 1:
-                            cover[i].add((f, ln))
-        seen: set = set()
-        left = set(range(n))
-        div = []
-        while left:
-            best = max(left, key=lambda i: (len(cover[i] - seen) / price[i], -i))
-            div.append(best)
-            seen |= cover[best]
-            left.discard(best)
-        _DIVERSE[id(rq)] = div
-    if kind == "diverse":
-        return list(div)
-    out: list = sorted(set(need), key=lambda i: (price[i], i))
-    fr = set(range(n)) if front is None else set(front)
-    out += sorted(fr - set(out), key=lambda i: (price[i], i))
-    done = set(out)
-    return out + [i for i in div if i not in done]
 
 
 # ---------------------------------------------------------------- import graph
@@ -1112,8 +1009,7 @@ class Analysis:
         self.patched: dict = {}  # rel path -> new text or None (deleted)
         self.applied = True
         self.sqlglot_modules: list = []  # changed importable sqlglot modules
-        self._rsafe = True  # every change is a function body the proxy covers
-        self.rsafe_why = ""  # where it first turned False, for the log
+        self.rsafe = True  # every change is a function body the proxy covers
         self.rq = 0  # parts of the TPC tests that reach a change outside the front end (see RQ)
         self.tpcds_only = False
         # TPC-DS queries whose front end may reach a change; fq_all: any
@@ -1132,20 +1028,6 @@ class Analysis:
         # the change, and a module that no longer imports fails every test
         self.imp_check = False
         self.imp_order = False  # an import statement changed: load order can matter
-
-
-def _get_rsafe(self):
-    return self._rsafe
-
-
-def _set_rsafe(self, v):
-    if self._rsafe and not v:
-        f = sys._getframe(1)
-        self.rsafe_why = f"{f.f_code.co_name}:{f.f_lineno}"
-    self._rsafe = v
-
-
-Analysis.rsafe = property(_get_rsafe, _set_rsafe)
 
 
 def leak_rule(a: Analysis, rel: str, old_tree, new_tree, sites):
@@ -1501,7 +1383,7 @@ class Analyzer:
                         text = open(path, encoding="utf-8", errors="replace").read()
                         if not pat.search(text):
                             continue
-                        b = self._meta_file(r, ast.parse(text), words, kind)
+                        b = self._meta_file(r, ast.parse(text), words)
                         if b is None:
                             out = None
                             raise StopIteration
@@ -1514,93 +1396,7 @@ class Analyzer:
         cache[kind] = out
         return out
 
-    def worker_unloaded(self, rel: str) -> bool:
-        """Whether rel is a module the TPC-DS pool workers never load on the
-        pinned tree (app/wmods.json, tools/wm_sitecustomize.py). Nothing in
-        it then runs there or shapes what runs there, whatever the change
-        to it, as long as the worker still does not load it. Only a changed
-        line that a worker runs could make it load the module, and the
-        replay runs every query reaching such a line on the patched tree."""
-        wm = self.__dict__.get("_wmods", 0)
-        if wm == 0:
-            try:
-                wm = set(json.load(open(os.path.join(APP, "wmods.json"))))
-            except Exception:  # noqa: BLE001
-                wm = None
-            self._wmods = wm
-        mod = module_name(rel)
-        return bool(wm) and rel.startswith("sqlglot/") and mod is not None and mod not in wm
-
-    def no_run_reach(self, a: Analysis, rel: str):
-        """A change outside function bodies the rules cannot place in the
-        TPC run: replayable only when the workers never load rel, and then
-        through every front end."""
-        if self.worker_unloaded(rel):
-            a.fq_all = True
-        else:
-            a.rsafe = False
-
-    def _defaults_site(self, rel: str, site: Site) -> tuple | None:
-        """Body span of a def whose header change is only literal default
-        values, when analyze_py takes it as callers only (the two
-        branches for "default values" and "literal default of method"
-        below); None otherwise."""
-        if site.kind != "header" or not site.new or len(site.nodes) != 1:
-            return None
-        o, n = site.nodes[0], site.new[0]
-        mp = self.mp
-        if _defaults_only(o, n) and not mp.has_import_line(rel, o.body[0].lineno, o.end_lineno):
-            live = [x for x in o.body if _has_line_event(x)]
-            if not live:
-                return None
-            return live[0].lineno, o.end_lineno
-        if site.scope and site.scope[-1][0] == "class":
-            sp = _defaults_span(o, n)
-            if sp is not None and not mp.has_import_line(rel, sp[0], sp[1]):
-                return sp
-        return None
-
-    def tpc_span(self, rel: str, lo: int, hi: int) -> tuple:
-        """(run bits, front bits or None for every front) of the TPC-DS
-        queries running a line of rel in lo..hi (see RQ)."""
-        rq = self.rq
-        if rq is None:
-            return self.r_rest, None
-        fb = None if rq.front is None else rq.line_bits(rel, lo, hi, front=True)
-        return rq.line_bits(rel, lo, hi), fb
-
-    def meta_tpc(self, kinds) -> tuple | None:
-        """What a docstring or annotation edit means for the TPC replay:
-        (run bits, front bits or None for every front) over the lines that
-        read __doc__ or the annotations, as RQ records them. The edit
-        changes nothing else, so the replay sees it exactly where those
-        lines run. None when a TPC test is among the readers."""
-        rq = self.rq
-        if rq is None:
-            return None
-        tpc = 0
-        for tid in TPC_IDS:
-            k = self.mp.num_of_id.get(tid)
-            if k is not None:
-                tpc |= 1 << k
-        rbits, fbits = 0, 0
-        for kind in kinds:
-            r = self.meta_readers(kind)
-            if r is None or r & tpc:
-                return None
-            for f, line in self.__dict__.get("_meta_where", {}).get(kind, []):
-                if line is None:
-                    # a test file reading it at import: its own tests only,
-                    # in readers, and none of them is a TPC test
-                    continue
-                rbits |= rq.line_bits(f, line, line)
-                if rq.front is None:
-                    fbits = None
-                elif fbits is not None:
-                    fbits |= rq.line_bits(f, line, line, front=True)
-        return rbits, fbits
-
-    def _meta_file(self, rel: str, tree, words, kind: str = "") -> int | None:
+    def _meta_file(self, rel: str, tree, words) -> int | None:
         """Tests reaching the uses of words in one file. A use inside a
         function counts for the tests running that line; a use the import
         runs counts for the file's own tests when it is a test file, and
@@ -1616,10 +1412,6 @@ class Analyzer:
             elif isinstance(node, ast.Assign) and all(isinstance(t, ast.Attribute) and t.attr == "__doc__"
                                                        for t in node.targets):
                 skip.update(id(x) for x in ast.walk(node))
-        if kind == "sig":
-            skip |= _names_only_introspection(tree)
-        # where each use sits, for the TPC replay (meta_tpc)
-        where = self.__dict__.setdefault("_meta_where", {}).setdefault(kind, [])
         out = 0
 
         def visit(node, fn):
@@ -1643,10 +1435,8 @@ class Analyzer:
                     line = getattr(hit, "lineno", None) or getattr(node, "lineno", None)
                     if f is not None and line is not None and not mp.has_import_line(rel, line, line):
                         out |= mp.lines_tests(rel, line, line)
-                        where.append((rel, line))
                     elif rel.startswith("tests/"):
                         out |= self.module_rule(rel)
-                        where.append((rel, None))
                     else:
                         return False
                 if visit(ch, f) is False:
@@ -2666,7 +2456,7 @@ class Analyzer:
                 lo, hi = _span(n)
                 b |= mp.lines_tests(rel, lo, hi)
             a.cand |= b
-            self.no_run_reach(a, rel)
+            a.rsafe = False
             a.broad |= self.module_rule(rel)
             a.reasons.append(f"reordered functions {rel}, {len(bits_list(b))} call them")
             return
@@ -2678,14 +2468,13 @@ class Analyzer:
                 for nd in list(st.nodes) + list(st.new or []):
                     if any(isinstance(x, (ast.Import, ast.ImportFrom)) for x in ast.walk(nd)):
                         a.imp_order = True
-        meta = [st for st in sites if _meta_kind(st, old_tree, new_tree) is not None]
+        meta = [st for st in sites if _meta_kind(st, old_tree) is not None]
         if meta:
             # a docstring reworded, or a bare annotation added or removed: no
             # statement runs differently, only __doc__ or __annotations__ holds
             # another value, so only the code that reads those can tell
             readers = 0
-            kinds = {_meta_kind(st, old_tree, new_tree) for st in meta}
-            for kind in kinds:
+            for kind in {_meta_kind(st, old_tree) for st in meta}:
                 r = self.meta_readers(kind)
                 if r is None:
                     readers = None
@@ -2694,17 +2483,7 @@ class Analyzer:
             if readers is not None:
                 sites = [st for st in sites if st not in meta]
                 a.cand |= readers | mp.spawn
-                # the TPC tests are in spawn (their pool workers): the
-                # replay checks them where a reading line runs
-                tb = self.meta_tpc(kinds) if is_pkg else None
-                if tb is None:
-                    a.rsafe = False
-                else:
-                    a.rq |= tb[0]
-                    if tb[1] is None:
-                        a.fq_all = True
-                    else:
-                        a.fq |= tb[1]
+                a.rsafe = False
                 a.reasons.append(f"{len(meta)} docstring or annotation edits {rel}")
                 if not sites:
                     a.broad |= mp.file_tests(rel)
@@ -2724,7 +2503,7 @@ class Analyzer:
             b = self.rebind_rule(rel, old_tree, new_tree)
             if b is not None:
                 a.cand |= b
-                self.no_run_reach(a, rel)
+                a.rsafe = False
                 a.broad |= mp.file_tests(rel)
                 a.reasons.append(f"import names {rel}, {len(bits_list(b))} use them")
                 return
@@ -2759,16 +2538,6 @@ class Analyzer:
                         a.fq_all = True
                     else:
                         a.fq |= fb
-            elif is_pkg and (dsp := self._defaults_site(rel, site)) is not None:
-                # only literal defaults changed and the rules below take the
-                # callers alone: a default is read only by a call that runs
-                # the body, so the replay needs the queries running it
-                rb, fb = self.tpc_span(rel, dsp[0], dsp[1])
-                a.rq |= rb
-                if fb is None:
-                    a.fq_all = True
-                else:
-                    a.fq |= fb
             elif not (site.kind == "insert" and not scope and _new_unused_defs(site.nodes, old_text, self._name_known)):
                 cr = self.const_rule(site) if not scope and is_pkg else None
                 fb = self.f_const(site) if cr is not None else None
@@ -2778,8 +2547,6 @@ class Analyzer:
                     a.fq |= fb
                 if cr is None or cr[1]:
                     vb = self.r_static(rel, site, cr) if is_pkg else None
-                    if vb is None and is_pkg and self.worker_unloaded(rel):
-                        vb = 0  # fq_all is set above: every front end is replayed
                     if vb is None:
                         a.rsafe = False
                     else:
@@ -2811,8 +2578,7 @@ class Analyzer:
                     sp = _defaults_span(site.nodes[0], site.new[0])
                 if sp is not None and not mp.has_import_line(rel, sp[0], sp[1]):
                     a.cand |= mp.lines_tests(rel, sp[0], sp[1]) | mp.spawn
-                    if self._defaults_site(rel, site) is None:
-                        a.rsafe = False
+                    a.rsafe = False
                     a.broad |= self.class_rule(rel, scope)
                     a.reasons.append(f"literal default of method {site.nodes[0].name} {rel}, callers only")
                     continue
@@ -2882,7 +2648,7 @@ class Analyzer:
                         a.reasons.append(f"constant read at run time {rel}")
                     elif tb is not None:
                         a.cand |= tb | mp.spawn
-                        self.no_run_reach(a, rel)
+                        a.rsafe = False
                         a.reasons.append(f"table entries read at run time {rel}, {len(bits_list(tb))} read them")
                     else:
                         a.cand |= self.module_rule(rel) | self.import_dependents(site, rel)
@@ -3033,12 +2799,10 @@ def _future_annotations(tree) -> bool:
 _ANN_BASES = {"TypedDict", "NamedTuple", "Protocol"}
 
 
-def _meta_kind(site, old_tree, new_tree=None) -> str | None:
+def _meta_kind(site, old_tree) -> str | None:
     """"doc" for a docstring whose text alone changed, "ann" for a bare
     annotation (x: T, no value) added or removed in a module or class body
-    that never evaluates it, "sig" for a def whose parameter or return
-    annotations alone changed in a module that never evaluates them, None
-    for anything else."""
+    that never evaluates it, None for anything else."""
     p = site.parent
     body = getattr(p, "body", None)
     if site.kind == "replace" and site.new and len(site.nodes) == 1 and len(site.new) == 1:
@@ -3046,20 +2810,13 @@ def _meta_kind(site, old_tree, new_tree=None) -> str | None:
         if _docstring(o) and _docstring(n) and body and body[0] is o \
                 and isinstance(p, (ast.Module, ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
             return "doc"
-    # without the future import on both sides a def or a class or module
-    # body evaluates the annotation
-    lazy = _future_annotations(old_tree) and (new_tree is None or _future_annotations(new_tree))
-    if site.kind == "header" and site.new and len(site.nodes) == 1 and len(site.new) == 1:
-        if lazy and _sig_only(site.nodes[0], site.new[0], old_tree):
-            return "sig"
-        return None
     nodes = list(site.nodes) + list(site.new or [])
     if site.kind not in ("replace", "insert") or not nodes:
         return None
     if not all(isinstance(n, ast.AnnAssign) and n.value is None and isinstance(n.target, ast.Name) and n.simple
                for n in nodes):
         return None
-    if not lazy:
+    if not _future_annotations(old_tree):
         return None  # without it a class or module body evaluates the annotation
     if p is old_tree:
         return "ann"
@@ -3074,104 +2831,11 @@ def _meta_kind(site, old_tree, new_tree=None) -> str | None:
     return None
 
 
-# decorators that take a function and never read its annotations (wraps
-# copies them onto the wrapper, which only passes the text on)
-_SIG_DECOS = {"staticmethod", "classmethod", "property", "setter", "getter", "deleter", "abstractmethod",
-              "overload", "cache", "lru_cache", "cached_property", "wraps"}
-
-
-def _sig_only(o, n, tree) -> bool:
-    """Two defs that differ only in parameter or return annotations, with
-    the same name, parameters, defaults, decorators and body. Under
-    `from __future__ import annotations` the def stores them as strings in
-    __annotations__ and evaluates nothing, so only code reading
-    __annotations__ (or a tool built on it) can tell the two apart. Every
-    decorator is a builtin or functools/typing one that does not read them,
-    or a name the module defines or imports from sqlglot, whose code the
-    reader scan (meta_readers) covers."""
-    if not isinstance(o, (ast.FunctionDef, ast.AsyncFunctionDef)) or type(n) is not type(o):
-        return False
-    if o.name != n.name or [_dump(x) for x in o.body] != [_dump(x) for x in n.body]:
-        return False
-    oc, nc = _copy(o), _copy(n)
-    for c in (oc, nc):
-        a = c.args
-        for x in a.posonlyargs + a.args + a.kwonlyargs + [y for y in (a.vararg, a.kwarg) if y is not None]:
-            x.annotation = None
-        c.returns = None
-    if _header(oc) != _header(nc) or _header(o) == _header(n):
-        return False
-    local = set()
-    for st in tree.body:
-        if isinstance(st, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-            local.add(st.name)
-        elif isinstance(st, ast.ImportFrom) and (st.level or (st.module or "").split(".")[0] == "sqlglot"):
-            local.update((x.asname or x.name) for x in st.names)
-    for d in o.decorator_list:
-        f = d.func if isinstance(d, ast.Call) else d
-        if isinstance(f, ast.Name):
-            if f.id not in _SIG_DECOS and f.id not in local:
-                return False
-        elif isinstance(f, ast.Attribute):
-            root = f
-            while isinstance(root, ast.Attribute):
-                root = root.value
-            if f.attr in _SIG_DECOS:
-                if f.attr in ("setter", "getter", "deleter"):
-                    continue  # @name.setter of a property in this class
-                if not (isinstance(root, ast.Name) and root.id in ("functools", "typing", "t", "abc")):
-                    return False
-            elif not (isinstance(root, ast.Name) and root.id in local):
-                return False
-        else:
-            return False
-    return True
-
-
-def _names_only_introspection(tree) -> set:
-    """ids of `signature` and `getfullargspec` uses whose result only gives
-    parameter names: inspect.getfullargspec(f).args, and
-    inspect.signature(f).parameters iterated (its keys are the names)."""
-    out: set = set()
-    parent: dict = {}
-    for node in ast.walk(tree):
-        for ch in ast.iter_child_nodes(node):
-            parent[id(ch)] = node
-
-    def callee(c):
-        f = c.func
-        return f.attr if isinstance(f, ast.Attribute) else f.id if isinstance(f, ast.Name) else None
-
-    for node in ast.walk(tree):
-        if not isinstance(node, ast.Call) or callee(node) not in ("signature", "getfullargspec"):
-            continue
-        up = parent.get(id(node))
-        if not isinstance(up, ast.Attribute) or up.value is not node:
-            continue
-        ok = False
-        if callee(node) == "getfullargspec" and up.attr == "args":
-            ok = True
-        elif callee(node) == "signature" and up.attr == "parameters":
-            u2 = parent.get(id(up))
-            if isinstance(u2, ast.Call) and isinstance(u2.func, ast.Name) and u2.func.id == "enumerate" \
-                    and len(u2.args) == 1 and u2.args[0] is up and not u2.keywords:
-                ok = True
-            elif isinstance(u2, (ast.For, ast.comprehension)) and u2.iter is up:
-                ok = True
-        if ok:
-            out.update(id(x) for x in ast.walk(node.func))
-    return out
-
-
 _META_WORDS = {
     "doc": ("__doc__", "doctest", "pydoc", "getdoc"),
     # dataclass, NamedTuple, TypedDict and Protocol read only the class they
     # make, and _meta_kind looks at that class's decorators and bases
     "ann": ("__annotations__", "__annotate__", "get_type_hints", "get_annotations", "annotationlib"),
-    # a def's annotations are also what inspect.signature and getfullargspec
-    # report, beside the names (_names_only_introspection)
-    "sig": ("__annotations__", "__annotate__", "get_type_hints", "get_annotations", "annotationlib",
-            "signature", "getfullargspec", "getcallargs", "__signature__"),
 }
 
 
@@ -4498,9 +4162,6 @@ def child_verify(job: dict, out_path: str):
             else:
                 failed.update(job["ids"])
                 rc = 1
-        for nid in job.get("standin", ()):
-            if not max_nodes_standin():
-                failed.add(nid)
         result = {"failed": sorted(failed), "rc": int(rc)}
         if job.get("proxy"):
             # after pytest, so the proxy cannot change what the tests saw
@@ -4511,23 +4172,10 @@ def child_verify(job: dict, out_path: str):
             result["proxy_info"] = {}
             for tid in job["proxy"]:
                 info: dict = {}
-                risk = job.get("proxy_risk") if tid == proxy.TPCDS else None
-                if risk is not None and not job.get("proxy_exact", True):
-                    ok = False
-                    info["stop"] = "risk only"
-                else:
-                    ok = proxy.check(tid, job["proxy_base"].get(tid), need=job.get("proxy_need", ()),
-                                     costs=job.get("proxy_costs"), budget=job.get("proxy_budget", 0.0),
-                                     info=info, front=job.get("proxy_front"), cap=job.get("proxy_cap"),
-                                     fcosts=job.get("proxy_fcosts"))
-                if not ok and risk is not None and str(info.get("stop", "")).startswith(proxy.NO_EVIDENCE):
-                    try:
-                        ok = proxy.risk_tpcds(job["proxy_base"].get(tid), risk["order"], risk["budget"],
-                                              job.get("proxy_costs"), job.get("proxy_fcosts"), info)
-                    except BaseException as e:  # noqa: BLE001
-                        info["risk_stop"] = f"{type(e).__name__}: {e}"[:200]
-                        ok = False
-                if ok:
+                if proxy.check(tid, job["proxy_base"].get(tid), need=job.get("proxy_need", ()),
+                               costs=job.get("proxy_costs"), budget=job.get("proxy_budget", 0.0),
+                               info=info, front=job.get("proxy_front"), cap=job.get("proxy_cap"),
+                               fcosts=job.get("proxy_fcosts")):
                     result["proxy_ok"].append(tid)
                 if info:
                     result["proxy_info"][tid] = info
@@ -4827,16 +4475,6 @@ def main():
         tp_cpu = 0.0
         tp_gain = 0
         tp = [t for t in px if ids[t] == TPCDS_ID]
-        tpn0 = num_of_id.get(TPCDS_ID)
-        if tpn0 in cand:
-            if a.full:
-                plan[c]["tp_path"] = "select everything"
-            elif not (a.rsafe and a.applied and verify_on):
-                plan[c]["tp_path"] = f"not replayable ({a.rsafe_why or 'patch not applied'})"
-            elif tpn0 not in px:
-                plan[c]["tp_path"] = "no proxy baseline or tpcds_only filter"
-            else:
-                plan[c]["tp_path"] = "replay planned"
         if tp and an.rq is not None:
             fixture = "tests/fixtures/optimizer/tpc-ds/tpc-ds.sql" in a.patched
             if not (a.fq_all or an.rq.front is None):
@@ -4854,24 +4492,6 @@ def main():
                     f"planned {tp_cpu:.1f}s cpu for {gain / 1000:.1f}s")
                 px = [t for t in px if ids[t] != TPCDS_ID]
                 tp = []
-                plan[c]["tp_path"] = (f"replay skipped at planning ({len(need)} run queries {need_cost:.1f}s, "
-                                      f"planned {tp_cpu:.1f}s for {gain / 1000:.1f}s)")
-        # the risk dial: a TPC-DS test no proof will clear gets a sampled replay
-        risk = None
-        tpn = num_of_id.get(TPCDS_ID)
-        if RISK_BUDGET > 0 and an.rq is not None and verify_on and not a.full and a.applied \
-                and tpn in proxy_nums and tpn in cand and not a.gone and not a.collect \
-                and all(r in TPC_FIXTURES or (r.startswith("sqlglot/") and r.endswith(".py"))
-                        for r in a.patched):
-            r_gain = pack_cost(cand, dur) - pack_cost([t for t in cand if t != tpn], dur)
-            if r_gain / 1000 > RISK_BUDGET + 1.0:
-                fr = None if (a.fq_all or an.rq.front is None
-                              or "tests/fixtures/optimizer/tpc-ds/tpc-ds.sql" in a.patched) \
-                    else an.rq.queries(a.fq)
-                risk = {"budget": RISK_BUDGET, "order": risk_order(an.rq, need, fr, RISK_ORDER)}
-                if not tp:
-                    px = [t for t in px if t != tpn] + [tpn]
-                    tp_gain = r_gain
         other = [t for t in px if ids[t] != TPCDS_ID]
         if other:
             # the TPC-H digests: about 0.2 s a test, plus the job when it
@@ -4881,7 +4501,7 @@ def main():
             o_gain = pack_cost(rest, dur) - pack_cost([t for t in rest if t not in other], dur)
             if o_cpu * 1000 > 0.3 * o_gain:
                 log(f"{c}: TPC-H proxy skipped, planned {o_cpu:.1f}s cpu for {o_gain / 1000:.1f}s")
-                px = [t for t in px if ids[t] == TPCDS_ID]
+                px = tp[:]
         if px:
             cand = [t for t in cand if t not in px]
             base_cost = pack_cost(cand, dur)
@@ -4897,14 +4517,6 @@ def main():
                 "est_wall": 1.5 + 0.25 * sum(secs[t] for t in px),
                 "max_wall": 30.0 + 1.0 * sum(secs[t] for t in px),
             })
-            if risk is not None:
-                jobs[-1]["proxy_risk"] = risk
-                jobs[-1]["proxy_exact"] = bool(tp)
-                jobs[-1]["proxy_costs"] = an.rq.cost
-                jobs[-1]["proxy_fcosts"] = an.rq.fcost
-                jobs[-1]["est_wall"] += RISK_BUDGET + 1.0
-                jobs[-1]["max_wall"] += 3.0 * RISK_BUDGET + 10.0
-                log(f"{c}: risk replay up to {RISK_BUDGET:.1f}s for {tp_gain / 1000:.1f}s")
             if an.rq is not None and tp:
                 jobs[-1]["proxy_need"] = need
                 jobs[-1]["proxy_front"] = front_q
@@ -4957,9 +4569,6 @@ def main():
                 hfiles: set = set()
                 for t in hv:
                     f = tests[t]["file"]
-                    if STANDIN_ON and ids[t] == MAXNODES_ID:
-                        hcpu += STANDIN_CPU / cpu_scale
-                        continue
                     hcpu += secs[t] * id_factor.get(ids[t], test_factor.get(f, 1.2)) + 0.003
                     if f not in hfiles:
                         hfiles.add(f)
@@ -4998,24 +4607,14 @@ def main():
             "est_wall": 1.5 + vsec * 1.6,
             "max_wall": 20.0 + vsec * 4.0,
         }
-        if STANDIN_ON and MAXNODES_ID in job["ids"]:
-            k = job["ids"].index(MAXNODES_ID)
-            job["ids"].pop(k)
-            job["secs"].pop(k)
-            job["limits"].pop(MAXNODES_ID, None)
-            job["standin"] = [MAXNODES_ID]
-            vs = sum(job["secs"])
-            job["est_wall"] = 1.5 + vs * 1.6 + STANDIN_CPU
-            job["max_wall"] = 20.0 + vs * 4.0 + 10.0
-        if job["ids"] and all(i in FREEZE_IDS for i in job["ids"]):
+        if all(i in FREEZE_IDS for i in job["ids"]):
             job["freeze"] = True
         if plan[c]["proxy"]:
             # one child does both: the tests, then the proxy
             pj = jobs.pop()
             job["proxy"] = pj["proxy"]
             job["proxy_base"] = pj["proxy_base"]
-            for k in ("proxy_need", "proxy_front", "proxy_cap", "proxy_costs", "proxy_fcosts", "proxy_budget",
-                      "proxy_risk", "proxy_exact"):
+            for k in ("proxy_need", "proxy_front", "proxy_cap", "proxy_costs", "proxy_fcosts", "proxy_budget"):
                 if k in pj:
                     job[k] = pj[k]
             job["gain"] += pj["gain"]
@@ -5195,22 +4794,21 @@ def main():
                 for nid in res["failed"]:
                     if nid in num_of:
                         out.add(num_of[nid])
+        # ablation switch: leave out every test at or above this many ms
+        drop = int(os.environ.get("BLAST_DROP_MS", "0"))
+        if drop:
+            gone = {t for t in range(n) if dur[t] >= drop}
+            if out & gone:
+                log(f"{c}: ablation leaves out {len(out & gone)} slow tests")
+            out = set(out) - gone
+        else:
+            gone = set()
         sel = sorted(out)
-        for t in sel:
-            if dur[t] >= 20000:
-                why = plan[c].get("tp_path", "") if ids[t] == TPCDS_ID else ""
-                if not why:
-                    why = "select everything" if a.full else (
-                        "verify" if t in plan[c]["verify"] else "kept unverified")
-                if ids[t] == TPCDS_ID and plan[c]["proxy"] and t in plan[c]["proxy"]:
-                    info = ((res or {}).get("proxy_info") or {}).get(TPCDS_ID, {})
-                    why = f"replay did not clear: {info.get('stop', '')} {info.get('risk_stop', '')}".strip()
-                log(f"{c}: slow test kept {ids[t].split('::')[-1]}: {why}")
         workers, loads, cost = best_pack(sel, dur)
         total += cost
         if workers:
-            extra = [t for t in sorted(bits_list(a.cand | a.broad), key=lambda t: dur[t]) if t not in out]
-            rest = [t for t in sorted(range(n), key=lambda t: dur[t]) if t not in out and not (a.cand | a.broad) >> t & 1]
+            extra = [t for t in sorted(bits_list(a.cand | a.broad), key=lambda t: dur[t]) if t not in out and t not in gone]
+            rest = [t for t in sorted(range(n), key=lambda t: dur[t]) if t not in out and t not in gone and not (a.cand | a.broad) >> t & 1]
             workers = fill_slack(workers, loads, extra + rest, dur)
         workers = [w for w in workers if w]
         print(json.dumps({"commit": c, "workers": workers}), flush=True)
