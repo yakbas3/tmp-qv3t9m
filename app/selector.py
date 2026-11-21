@@ -41,6 +41,18 @@ HEAVY_MIN_MS = 3000  # a candidate this slow may be verified alone
 # collect scans only what the test itself made. Measured 3.7 s to 1.3 s CPU.
 FREEZE_IDS = {"tests/test_generator.py::TestGenerator::test_generator_memory"}
 PROXY_MIN_MS = 3000  # tests cheaper than this are not worth the proxy run
+TPCDS_ID = "tests/test_executor.py::TestExecutor::test_execute_tpcds"
+# CPU seconds the proxy may spend running TPC-DS queries for one commit. A
+# run pays off only when the test is then cleared, which is no better than
+# an even bet, and the test costs 21 s when kept.
+REPLAY_BUDGET = float(os.environ.get("BLAST_REPLAY_BUDGET", "8.0"))
+# Off: r_class does not yet follow a class attribute read through a class
+# object (self.dialect.tokenizer_class.NUMERIC_ESCAPES, cls.TRANSFORMS), so
+# it can clear a TPC test that reads the change.
+R_CLASS_ON = os.environ.get("BLAST_R_CLASS") == "1"
+# fixture files test_execute_tpcds reads: setUpClass loads both, the test
+# uses the TPC-DS pairs' meta and SQL
+TPC_FIXTURES = {"tests/fixtures/optimizer/tpc-ds/tpc-ds.sql", "tests/fixtures/optimizer/tpc-h/tpc-h.sql"}
 
 CONFIG_FILES = {"pyproject.toml", "setup.cfg", "pytest.ini", "tox.ini", "conftest.py", "setup.py",
                 ".pytest.ini", "pytest.toml", ".pytest.toml"}
@@ -324,6 +336,64 @@ class Map:
         if not s:
             return False
         return any(l in s for l in range(lo, hi + 1))
+
+
+class RQ:
+    """What the TPC executor tests reach outside the proxied front end
+    (tools/rq_build.py). Bit i stands for the worker's run of TPC-DS query
+    i, bit nq for the rest of the three tests."""
+
+    def __init__(self, path: str):
+        m = json.loads(gzip.decompress(open(path, "rb").read()))
+        self.nq = int(m["nq"])
+        self.rest = 1 << self.nq
+        self.all = (1 << (self.nq + 1)) - 1
+        self.cost = [float(c) for c in m["cost"]]
+        sets = [int(x, 16) for x in m["sets"]]
+        self.lines = {f: ([p[0] for p in v], [sets[p[1]] for p in v]) for f, v in m["lines"].items()}
+        self.types = {k: sets[v] for k, v in m["types"].items()}
+        # per query, the lines its front end (proxy.Replay.front) reaches,
+        # and what recomputing that front end costs (tools/rq_front.py)
+        self.front = None
+        if "front" in m:
+            self.front = {f: ([p[0] for p in v], [sets[p[1]] for p in v]) for f, v in m["front"].items()}
+        self.fcost = [float(c) for c in m.get("fcost", [0.0] * self.nq)]
+        self._files: dict = {}
+
+    def line_bits(self, f: str, lo: int, hi: int, front: bool = False) -> int:
+        c = (self.front if front else self.lines).get(f)
+        if c is None:
+            return 0
+        lns, bits = c
+        out = 0
+        i = bisect.bisect_left(lns, lo)
+        while i < len(lns) and lns[i] <= hi:
+            out |= bits[i]
+            i += 1
+        return out
+
+    def file_bits(self, f: str) -> int:
+        b = self._files.get(f)
+        if b is None:
+            b = 0
+            for x in self.lines.get(f, ((), ()))[1]:
+                b |= x
+            self._files[f] = b
+        return b
+
+    def type_bits(self, key: str) -> int:
+        return self.types.get(key, 0)
+
+    def module_type_bits(self, module: str) -> int:
+        out = 0
+        prefix = module + ":"
+        for k, b in self.types.items():
+            if k.startswith(prefix):
+                out |= b
+        return out
+
+    def queries(self, bits: int) -> list:
+        return [i for i in range(self.nq) if bits >> i & 1]
 
 
 # ---------------------------------------------------------------- import graph
@@ -896,6 +966,11 @@ class Analysis:
         self.applied = True
         self.sqlglot_modules: list = []  # changed importable sqlglot modules
         self.rsafe = True  # every change is a function body the proxy covers
+        self.rq = 0  # parts of the TPC tests that reach a change outside the front end (see RQ)
+        self.tpcds_only = False
+        # TPC-DS queries whose front end may reach a change; fq_all: any
+        self.fq = 0
+        self.fq_all = False  # a TPC fixture changed: only the TPC-DS proxy reads it as the test does
         self.gone = False  # a package file was deleted or renamed
         self.imp = 0  # tests that can see the change only through import-time state
         # impfp keys a nested class change may alter (see nested_rule); only
@@ -926,7 +1001,7 @@ def leak_rule(a: Analysis, rel: str, old_tree, new_tree, sites):
 
 
 class Analyzer:
-    def __init__(self, mp: Map, index: dict, rlines: dict | None = None):
+    def __init__(self, mp: Map, index: dict, rlines: dict | None = None, rq: RQ | None = None):
         self.mp = mp
         self.importers = index["importers"]
         self.refs = index.get("refs", {})
@@ -935,6 +1010,9 @@ class Analyzer:
         self._module_rule: dict = {}
         # lines the TPC executor tests run outside the proxied front end
         self.rlines = rlines
+        # the same, per TPC-DS query; without it every reach counts for the whole test
+        self.rq = rq
+        self.r_rest = rq.rest if rq is not None else 1
         self.edges = index.get("edges")
         self.eager = set(index["eager"]) if "eager" in index else None
         self.mentions = index.get("mentions", {})
@@ -1454,6 +1532,113 @@ class Analyzer:
         if not lines:
             return False
         return any(l in lines for lo, hi in self.site_spans(site) for l in range(lo, hi + 1))
+
+    def r_bits(self, rel: str, site: Site) -> int:
+        """Parts of the TPC tests (see RQ) that may reach this change in a
+        function body outside the front end."""
+        rq = self.rq
+        if rq is None:
+            return self.r_rest if self.r_hit(rel, site) else 0
+        out = 0
+        for lo, hi in self.site_spans(site):
+            out |= rq.line_bits(rel, lo, hi)
+        return out
+
+    def f_bits(self, rel: str, site: Site) -> int | None:
+        """TPC-DS queries whose front end may run this changed function
+        body. None when there is no per-query front evidence."""
+        rq = self.rq
+        if rq is None or rq.front is None:
+            return None
+        out = 0
+        for lo, hi in self.site_spans(site):
+            out |= rq.line_bits(rel, lo, hi, front=True)
+        return out
+
+    def f_const(self, site: Site) -> int | None:
+        """The same for a module constant const_rule accepted: the front
+        ends that run a line reading it."""
+        rq = self.rq
+        if rq is None or rq.front is None or self.from_names is None:
+            return None
+        out = 0
+        for n in list(site.nodes) + list(site.new or []):
+            name = n.targets[0].id if isinstance(n, ast.Assign) else n.target.id
+            for f, line, _in_func, owner, *_ in self.refs.get(name, []):
+                if owner in ("self", "cls") and name not in self.from_names:
+                    continue
+                out |= rq.line_bits(f, line, line, front=True)
+        return out
+
+    def r_static(self, rel: str, site: Site, cr) -> int | None:
+        """Parts of the TPC tests (see RQ) that may see, outside the front
+        end, a change that is in no function body: a module constant (cr is
+        const_rule's answer) through the lines that read it, a class body
+        through the class. None when that cannot be shown."""
+        rq = self.rq
+        if rq is None:
+            return None
+        if not site.scope:
+            if cr is None or self.from_names is None:
+                return None
+            out = 0
+            for n in list(site.nodes) + list(site.new or []):
+                name = n.targets[0].id if isinstance(n, ast.Assign) else n.target.id
+                for f, line, _in_func, owner, *_ in self.refs.get(name, []):
+                    if owner in ("self", "cls") and name not in self.from_names:
+                        continue
+                    out |= rq.line_bits(f, line, line)
+            return out
+        if not R_CLASS_ON or any(sc[0] != "class" for sc in site.scope):
+            return None
+        return self.r_class(rel, site, set())
+
+    def r_class(self, rel: str, site: Site, seen: set) -> int:
+        """The class rule, the attribute rules and the import readers, taken
+        together and without their narrowing, over the TPC evidence: the
+        parts that run a line of the class, hold an instance of it, of a
+        subclass or of an outer class, run a line that reads a nested
+        class's changed name, or touch a module whose import reads it."""
+        rq, mp = self.rq, self.mp
+        scope = site.scope
+        mod = module_name(rel)
+        if not mod or not rel.startswith("sqlglot/"):
+            return rq.all
+        lo, hi = _span(scope[-1][2])
+        out = rq.line_bits(rel, lo, hi)
+        for k in range(len(scope), 0, -1):
+            key = f"{mod}:{'.'.join(sc[1] for sc in scope[:k])}"
+            if mp.class_tests(key) is None:
+                if k == len(scope):
+                    return rq.all  # a class the map cannot follow: the module rule
+                continue
+            out |= rq.type_bits(key)
+        for lo, hi in self.site_spans(site):
+            out |= rq.line_bits(rel, lo, hi)
+        if len(scope) > 1:
+            for n in list(site.nodes) + list(site.new or []):
+                names = []
+                if isinstance(n, ast.Assign):
+                    names = [t.id for t in n.targets if isinstance(t, ast.Name)]
+                elif isinstance(n, (ast.AnnAssign, ast.AugAssign)) and isinstance(n.target, ast.Name):
+                    names = [n.target.id]
+                elif isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                    names = [n.name]
+                for name in names:
+                    for f, line, _in_func, _owner, *_ in self.refs.get(name, []):
+                        out |= rq.line_bits(f, line, line)
+        for f, line in sorted(self._import_refs(site, rel)):
+            if (f, line) in seen:
+                continue
+            seen.add((f, line))
+            m2 = module_name(f)
+            if len(seen) > 64 or not f.startswith("sqlglot/") or not m2:
+                return rq.all
+            out |= rq.file_bits(f) | rq.module_type_bits(m2)
+            dep = self._class_stmt(f, line)
+            if dep is not None:
+                out |= self.r_class(f, dep, seen)
+        return out
 
     def _foreign_class(self, rel: str, via: list) -> bool:
         """Whether a reference mod.Cls.<...>.NAME names a class that module
@@ -2034,13 +2219,18 @@ class Analyzer:
                 a.reasons.append(f"analysis error {fd.old or fd.new}: {type(e).__name__}: {e}")
         a.cand |= mp.unknown
         a.broad |= a.cand | a.imp
+        if a.rq & self.r_rest:
+            a.rsafe = False
         return a
 
     def analyze_file(self, a: Analysis, fd: FileDiff):
         mp = self.mp
         old_rel, new_rel = fd.old, fd.new
         rel = old_rel or new_rel
-        if fd.binary or old_rel != new_rel or not (rel or "").startswith("sqlglot/") \
+        if not fd.binary and old_rel == new_rel and rel in TPC_FIXTURES:
+            # the TPC-DS proxy reads both from the patched tree (proxy.setup_ok)
+            a.tpcds_only = True
+        elif fd.binary or old_rel != new_rel or not (rel or "").startswith("sqlglot/") \
                 or not rel.endswith(".py"):
             a.rsafe = False
         if old_rel and old_rel != new_rel and old_rel.startswith("sqlglot/"):
@@ -2267,12 +2457,28 @@ class Analyzer:
                         a.broad |= b
                         b &= nb
                 a.cand |= b
-                if (at_import and not by_state) or self.r_hit(rel, site):
+                if at_import and not by_state:
                     a.rsafe = False
+                else:
+                    a.rq |= self.r_bits(rel, site)
+                    fb = self.f_bits(rel, site)
+                    if fb is None:
+                        a.fq_all = True
+                    else:
+                        a.fq |= fb
             elif not (site.kind == "insert" and not scope and _new_unused_defs(site.nodes, old_text)):
                 cr = self.const_rule(site) if not scope and is_pkg else None
+                fb = self.f_const(site) if cr is not None else None
+                if fb is None:
+                    a.fq_all = True
+                else:
+                    a.fq |= fb
                 if cr is None or cr[1]:
-                    a.rsafe = False
+                    vb = self.r_static(rel, site, cr) if is_pkg else None
+                    if vb is None:
+                        a.rsafe = False
+                    else:
+                        a.rq |= vb
             if in_func:
                 if by_state:
                     a.imp |= self.module_rule(rel)
@@ -3854,9 +4060,16 @@ def child_verify(job: dict, out_path: str):
             sys.path.insert(1, APP)
             import proxy
 
+            result["proxy_info"] = {}
             for tid in job["proxy"]:
-                if proxy.check(tid, job["proxy_base"].get(tid)):
+                info: dict = {}
+                if proxy.check(tid, job["proxy_base"].get(tid), need=job.get("proxy_need", ()),
+                               costs=job.get("proxy_costs"), budget=job.get("proxy_budget", 0.0),
+                               info=info, front=job.get("proxy_front"), cap=job.get("proxy_cap"),
+                               fcosts=job.get("proxy_fcosts")):
                     result["proxy_ok"].append(tid)
+                if info:
+                    result["proxy_info"][tid] = info
     except SystemExit:
         pass
     except BaseException as e:  # noqa: BLE001
@@ -4030,7 +4243,13 @@ def main():
             rlines = {f: set(v) for f, v in raw.items()}
         except Exception as e:  # noqa: BLE001
             log(f"proxy unavailable ({e})")
-        an = Analyzer(mp, index, rlines)
+        rq = None
+        if rlines is not None:
+            try:
+                rq = RQ(os.path.join(APP, "rq.json.gz"))
+            except Exception as e:  # noqa: BLE001
+                log(f"per-query TPC evidence unavailable ({e})")
+        an = Analyzer(mp, index, rlines, rq)
         try:
             an.tbl = json.loads(gzip.decompress(open(os.path.join(APP, "tbl.json.gz"), "rb").read()))
         except Exception as e:  # noqa: BLE001
@@ -4137,6 +4356,43 @@ def main():
         px = []
         if a.rsafe and not a.full and a.applied and verify_on:
             px = [t for t in cand if t in proxy_nums and dur[t] >= PROXY_MIN_MS]
+            if a.tpcds_only:
+                px = [t for t in px if ids[t] == TPCDS_ID]
+        # queries whose run in the worker reaches a change: the proxy runs
+        # them, when that is cheap enough to be worth the try
+        need = an.rq.queries(a.rq) if an.rq is not None else []
+        need_cost = sum(an.rq.cost[i] for i in need)
+        front_q = None
+        tp_cpu = 0.0
+        tp_gain = 0
+        tp = [t for t in px if ids[t] == TPCDS_ID]
+        if tp and an.rq is not None:
+            fixture = "tests/fixtures/optimizer/tpc-ds/tpc-ds.sql" in a.patched
+            if not (a.fq_all or an.rq.front is None):
+                front_q = an.rq.queries(a.fq)
+            # what the proxy spends before it can clear the test: the front
+            # ends it recomputes and the queries it runs
+            fq = range(an.rq.nq) if front_q is None or fixture else set(front_q) | set(need)
+            tp_cpu = 0.5 + sum(an.rq.fcost[i] for i in fq) + need_cost
+            gain = tp_gain = pack_cost(cand, dur) - pack_cost([t for t in cand if t not in tp], dur)
+            # a clear is no sure thing, and most commits that select the
+            # test really fail it: spend at most half of what it saves (the
+            # probes stop a failing commit after a cheap run or two)
+            if need_cost > REPLAY_BUDGET or tp_cpu * 1000 > 0.5 * gain:
+                log(f"{c}: tpcds replay skipped, {len(need)} queries ({need_cost:.1f}s), "
+                    f"planned {tp_cpu:.1f}s cpu for {gain / 1000:.1f}s")
+                px = [t for t in px if ids[t] != TPCDS_ID]
+                tp = []
+        other = [t for t in px if ids[t] != TPCDS_ID]
+        if other:
+            # the TPC-H digests: about 0.2 s a test, plus the job when it
+            # carries nothing else. Worth it only for what the packing saves.
+            o_cpu = 0.2 * len(other) + (0.0 if tp else 0.5)
+            rest = [t for t in cand if t not in tp]
+            o_gain = pack_cost(rest, dur) - pack_cost([t for t in rest if t not in other], dur)
+            if o_cpu * 1000 > 0.3 * o_gain:
+                log(f"{c}: TPC-H proxy skipped, planned {o_cpu:.1f}s cpu for {o_gain / 1000:.1f}s")
+                px = tp[:]
         if px:
             cand = [t for t in cand if t not in px]
             base_cost = pack_cost(cand, dur)
@@ -4152,8 +4408,20 @@ def main():
                 "est_wall": 1.5 + 0.25 * sum(secs[t] for t in px),
                 "max_wall": 30.0 + 1.0 * sum(secs[t] for t in px),
             })
+            if an.rq is not None and tp:
+                jobs[-1]["proxy_need"] = need
+                jobs[-1]["proxy_front"] = front_q
+                # the plan keeps to half the gain; past the whole gain the
+                # clear can no longer pay off (slack for a loaded machine)
+                jobs[-1]["proxy_cap"] = tp_gain / 1000
+                jobs[-1]["proxy_costs"] = an.rq.cost
+                jobs[-1]["proxy_fcosts"] = an.rq.fcost
+                jobs[-1]["proxy_budget"] = REPLAY_BUDGET
+                jobs[-1]["est_wall"] += tp_cpu
+                jobs[-1]["max_wall"] += 3.0 * REPLAY_BUDGET
             cjob[c] = jobs[-1]
-            log(f"{c}: proxy {len(px)} ({sum(secs[t] for t in px):.1f}s)")
+            log(f"{c}: proxy {len(px)} ({sum(secs[t] for t in px):.1f}s)"
+                + (f", runs {len(need)} queries ({need_cost:.1f}s)" if need else ""))
         if not cand or a.full or not a.applied or not verify_on:
             log(f"{c}: {len(cand)} cand, cost {base_cost / 1000:.1f}s, no verify {a.reasons[:3]}")
             continue
@@ -4237,6 +4505,9 @@ def main():
             pj = jobs.pop()
             job["proxy"] = pj["proxy"]
             job["proxy_base"] = pj["proxy_base"]
+            for k in ("proxy_need", "proxy_front", "proxy_cap", "proxy_costs", "proxy_fcosts", "proxy_budget"):
+                if k in pj:
+                    job[k] = pj[k]
             job["gain"] += pj["gain"]
             job["est_wall"] += pj["est_wall"]
             job["max_wall"] += pj["max_wall"]
@@ -4369,7 +4640,8 @@ def main():
             for t in p["proxy"]:
                 if ids[t] not in ok:
                     out.add(t)
-            log(f"{c}: proxy cleared {len(ok)} of {len(p['proxy'])}")
+            log(f"{c}: proxy cleared {len(ok)} of {len(p['proxy'])} "
+                f"{(res or {}).get('proxy_info') or ''}")
             if res and "import_error" in res:
                 log(f"{c}: patched sqlglot does not import: {res['import_error']}")
                 out = set(range(n))
