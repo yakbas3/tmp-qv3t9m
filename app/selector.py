@@ -587,6 +587,10 @@ def _call_name(c) -> str:
 
 
 CONST_RE = re.compile(r"^_?[A-Z][A-Z0-9_]{2,}$")
+# class attributes read only to fill a cache that outlives the test which
+# filled it (generator._build_dispatch, cached per class in _DISPATCH_CACHE):
+# later tests see them without running the line that names them
+_CACHED_READS = {"TRANSFORMS"}
 
 
 def _rebinds(tree, name: str) -> bool:
@@ -892,6 +896,7 @@ class Analysis:
         self.applied = True
         self.sqlglot_modules: list = []  # changed importable sqlglot modules
         self.rsafe = True  # every change is a function body the proxy covers
+        self.gone = False  # a package file was deleted or renamed
         self.imp = 0  # tests that can see the change only through import-time state
         # impfp keys a nested class change may alter (see nested_rule); only
         # honoured while every import-time doubt comes from that rule
@@ -1146,6 +1151,11 @@ class Analyzer:
         pat = re.compile(r"\b(" + "|".join(re.escape(n) for n in sorted(names)) + r")\b")
         out = 0
         prefix = d + "/" if d else ""
+        if any(v.startswith("autouse:") for k in names for v in (of.get(k, ""), nf.get(k, ""))):
+            # every test collected under the directory runs it
+            for f, b in self.mp.by_file.items():
+                if f.startswith(prefix):
+                    out |= b
         for root, dirs, files in os.walk(os.path.join(SRC, d)):
             dirs[:] = [x for x in dirs if x not in ("__pycache__", "fixtures")]
             for f in files:
@@ -1691,7 +1701,8 @@ class Analyzer:
         if site.kind not in ("replace", "insert") or not site.nodes:
             return None
         names = set()
-        for n in site.nodes:
+        # the patched statements too: an assignment may now bind another name
+        for n in list(site.nodes) + list(site.new or []):
             if isinstance(n, ast.Assign) and all(isinstance(t, ast.Name) for t in n.targets):
                 names.update(t.id for t in n.targets)
             elif isinstance(n, ast.AnnAssign) and isinstance(n.target, ast.Name):
@@ -1704,14 +1715,211 @@ class Analyzer:
         if inst is None:
             return None
         reach = 0
+        at_import = False
         for name in names:
-            if not CONST_RE.match(name) or name in self.strings:
+            if not CONST_RE.match(name) or name in self.strings or name in _CACHED_READS:
                 return None
             for f, line, in_func, _owner, *_ in self.refs.get(name, []):
-                if not in_func or mp.has_import_line(f, line, line):
+                if not in_func:
                     return None
+                if mp.has_import_line(f, line, line):
+                    at_import = True
                 reach |= mp.lines_tests(f, line, line)
-        return inst & reach
+        if not at_import:
+            return inst & reach
+        return self.attr_state_rule(rel, site, reach)
+
+    def state_readers(self, keys: list, patched: dict) -> int | None:
+        """Tests that can read what the import left behind at these impfp
+        keys (class attributes whose digest differs from the pinned tree's).
+        The digests cover everything the imports leave reachable from module
+        globals, so once the import ran, a test sees the difference only by
+        reading one of these attributes, on the class, a subclass or an
+        instance: a line that names it, in a test that touches the class or
+        names its module (a nested class: or instantiates it). None for a
+        module global, a class's bases, a name built or looked up as a
+        string, or a class this cannot find."""
+        mp = self.mp
+        out = mp.spawn
+        for k in keys:
+            mod, _, path = k.partition(":")
+            if "." not in path:
+                return None
+            qual, name = path.rsplit(".", 1)
+            if not CONST_RE.match(name) or name in self.strings or name in _CACHED_READS:
+                return None
+            base = mod.replace(".", "/")
+            rel = next((r for r in (base + ".py", base + "/__init__.py")
+                        if os.path.isfile(os.path.join(SRC, r))), None)
+            if rel is None or rel in patched and patched[rel] is None:
+                return None
+            text = patched.get(rel) or open(os.path.join(SRC, rel), encoding="utf-8").read()
+            body = ast.parse(text).body
+            scope: tuple = ()
+            for part in qual.split("."):
+                hit = [n for n in body if isinstance(n, ast.ClassDef) and n.name == part]
+                if len(hit) != 1:
+                    return None
+                scope = scope + (("class", part, hit[0]),)
+                body = hit[0].body
+            if rel in patched:
+                # the class_rule spans are pinned-tree lines
+                tree = ast.parse(open(os.path.join(SRC, rel), encoding="utf-8").read())
+                body = tree.body
+                old_scope: tuple = ()
+                for part in qual.split("."):
+                    hit = [n for n in body if isinstance(n, ast.ClassDef) and n.name == part]
+                    if len(hit) != 1:
+                        return None
+                    old_scope = old_scope + (("class", part, hit[0]),)
+                    body = hit[0].body
+                scope = old_scope
+            reach = 0
+            for f, line, *_ in self.refs.get(name, []):
+                reach |= mp.lines_tests(f, line, line)
+            word = os.path.basename(rel)[:-3].lower()
+            if word == "__init__":
+                word = os.path.basename(os.path.dirname(rel)).lower()
+            near = self.class_rule(rel, scope) | self.mention_tests(word)
+            out |= reach & near
+            if len(scope) > 1:
+                inst = mp.class_tests(f"{mod}:{qual}")
+                if inst is None:
+                    return None
+                out |= inst
+        return out
+
+    def method_rule(self, rel: str, site: Site) -> tuple | None:
+        """A method deleted from a class body, or a method whose header
+        (decorators, parameters) changed under the same name. A test sees
+        it at run time by looking the name up on the class, a subclass or an
+        instance. A lookup that called the pinned method ran its body (a
+        wrapper from a decorator may stop before the body: the decorator's
+        own code counts too); a line naming it counts as well. What the
+        class body left behind at import is compared with the pinned
+        tree's, the method itself excused. None for a new method name (a
+        lookup that found nothing, or a base's method, runs no line of it),
+        a name used as a string, a read at import, or a decorator this
+        cannot trace."""
+        mp = self.mp
+        scope = site.scope
+        if not scope or any(sc[0] != "class" for sc in scope):
+            return None
+        old = list(site.nodes)
+        new = list(site.new or [])
+        if site.kind == "header":
+            if len(old) != 1 or len(new) != 1 or old[0].name != new[0].name:
+                return None
+        elif site.kind != "replace" or new:
+            return None  # an insert, or a replacement that is not one to one
+        defs = (ast.FunctionDef, ast.AsyncFunctionDef)
+        if not old or not all(isinstance(n, defs) for n in old + new):
+            return None
+        mod = module_name(rel)
+        qual = ".".join(sc[1] for sc in scope)
+        base = os.path.basename(rel)[:-3].lower()
+        near = self.class_rule(rel, scope) | self.mention_tests(base)
+        cand = mp.spawn
+        for lo, hi in self.site_spans(site):
+            cand |= mp.lines_tests(rel, lo, hi)
+        names = set()
+        for n in old + new:
+            names.add(n.name)
+            lo, hi = _span(n)
+            if n in old:
+                cand |= mp.lines_tests(rel, lo, hi)
+            for dec in n.decorator_list:
+                sp = self._decorator_span(rel, dec)
+                if sp is None:
+                    return None
+                if sp:
+                    cand |= mp.lines_tests(sp[0], sp[1], sp[2]) & near
+        for name in names:
+            if name in self.strings or name.startswith("__"):
+                return None
+            for f, line, in_func, *_ in self.refs.get(name, []):
+                if not in_func:
+                    return None
+                cand |= mp.lines_tests(f, line, line) & near
+        return cand, self.class_rule(rel, scope), sorted({f"={mod}:{qual}.{x}" for x in names})
+
+    def _decorator_span(self, rel: str, dec):
+        """(file, first, last line) of the code a decorator runs around
+        calls, () for one that keeps the function (staticmethod,
+        classmethod, property, typing.overload), None when unknown."""
+        f = dec.func if isinstance(dec, ast.Call) else dec
+        if isinstance(dec, ast.Call) and not all(_literal(x) for x in list(dec.args) +
+                                                 [k.value for k in dec.keywords]):
+            return None
+        if isinstance(f, ast.Name) and f.id in ("staticmethod", "classmethod", "property") \
+                and not isinstance(dec, ast.Call):
+            return ()
+        if isinstance(f, ast.Attribute) and f.attr == "overload" and isinstance(f.value, ast.Name) \
+                and f.value.id in ("t", "typing") and not isinstance(dec, ast.Call):
+            return ()
+        if not isinstance(f, ast.Name):
+            return None
+        tree = ast.parse(open(os.path.join(SRC, rel), encoding="utf-8").read())
+        target = None
+        for n in tree.body:
+            if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name == f.id:
+                target = (rel, n)
+            elif isinstance(n, ast.ImportFrom) and n.level == 0 and n.module and n.module.startswith("sqlglot"):
+                for al in n.names:
+                    if (al.asname or al.name) == f.id:
+                        mb = n.module.replace(".", "/")
+                        for r in (mb + ".py", mb + "/__init__.py"):
+                            if os.path.isfile(os.path.join(SRC, r)):
+                                t2 = ast.parse(open(os.path.join(SRC, r), encoding="utf-8").read())
+                                hit = [x for x in t2.body if isinstance(x, (ast.FunctionDef, ast.AsyncFunctionDef))
+                                       and x.name == al.name]
+                                if len(hit) == 1:
+                                    target = (r, hit[0])
+                                break
+        if target is None:
+            return None
+        lo, hi = _span(target[1])
+        return (target[0], lo, hi)
+
+    def attr_state_rule(self, rel: str, site: Site, reach: int) -> tuple | None:
+        """attr_rule when a function the imports run reads the name (a parser
+        line some module's class body reaches while it parses a template).
+        What the import leaves behind is compared with the pinned tree's
+        (impfp.py), with only the changed attributes themselves excused;
+        if it matches, a test sees the new value only by reading it at run
+        time, on the class, a subclass or an instance. Such a read runs a
+        line that names the attribute, in a test that touches the class or
+        names its module. Only for a top-level class of the package, with
+        literal values. Returns (candidates, import-state tests, excused
+        impfp keys), or None."""
+        mp = self.mp
+        scope = site.scope
+        if len(scope) != 1 or scope[0][0] != "class" or not rel.startswith("sqlglot/"):
+            return None
+        names = []
+        for n in list(site.nodes) + list(site.new or []):
+            if isinstance(n, ast.Assign) and all(isinstance(t, ast.Name) for t in n.targets):
+                names += [t.id for t in n.targets]
+            elif isinstance(n, ast.AnnAssign) and isinstance(n.target, ast.Name) and n.value is not None:
+                names.append(n.target.id)
+            else:
+                return None
+            if not _literal(n.value):
+                return None
+        for name in names:
+            if not CONST_RE.match(name) or name in self.strings or name in _CACHED_READS:
+                return None
+            for _f, _line, in_func, *_ in self.refs.get(name, []):
+                if not in_func:
+                    return None
+        mod = module_name(rel)
+        qual = scope[0][1]
+        outer = self.class_rule(rel, scope)
+        base = os.path.basename(rel)[:-3].lower()
+        cand = reach & (outer | self.mention_tests(base)) | mp.spawn
+        for lo, hi in self.site_spans(site):
+            cand |= mp.lines_tests(rel, lo, hi)
+        return cand, outer, sorted({f"={mod}:{qual}.{x}" for x in names})
 
     def nested_rule(self, rel: str, site: Site, seen: set | None = None,
                     top: bool = False) -> tuple[int, int, list] | None:
@@ -1835,6 +2043,8 @@ class Analyzer:
         if fd.binary or old_rel != new_rel or not (rel or "").startswith("sqlglot/") \
                 or not rel.endswith(".py"):
             a.rsafe = False
+        if old_rel and old_rel != new_rel and old_rel.startswith("sqlglot/"):
+            a.gone = True  # a package file was deleted or renamed
         if fd.binary:
             a.full = True
             a.applied = False
@@ -1980,6 +2190,20 @@ class Analyzer:
             a.rsafe = False
         sites = diff_ast(old_tree, new_tree)
         leak_rule(a, rel, old_tree, new_tree, sites)
+        moved = _reordered_defs(old_tree, new_tree)
+        if moved is not None and not a.full:
+            # the same plain functions, bound in another order: the import
+            # leaves the same names bound to the same code, only at other
+            # lines. Tests that call them, read the file or spawn a tool.
+            b = mp.spawn
+            for n in moved:
+                lo, hi = _span(n)
+                b |= mp.lines_tests(rel, lo, hi)
+            a.cand |= b
+            a.rsafe = False
+            a.broad |= self.module_rule(rel)
+            a.reasons.append(f"reordered functions {rel}, {len(bits_list(b))} call them")
+            return
         if is_pkg and any(not any(s[0] == "func" for s in st.scope) for st in sites):
             a.imp_check = True
         meta = [st for st in sites if _meta_kind(st, old_tree) is not None]
@@ -2057,11 +2281,23 @@ class Analyzer:
                 elif at_import:
                     a.cand |= self.module_rule(rel)
                     a.reasons.append(f"import-time code {rel}")
+            elif site.kind == "header" and _defaults_only(site.nodes[0], (site.new or [None])[0]) \
+                    and not mp.has_import_line(rel, site.nodes[0].body[0].lineno, site.nodes[0].end_lineno):
+                # (a call the imports make sees the new default too, and what
+                # it builds outlives the import: left to the rules below)
+                # only literal default values of a def changed: a default is
+                # bound when the def runs and read when a call omits the
+                # argument, and then the body runs
+                lo, hi = _span(site.nodes[0])
+                a.cand |= mp.lines_tests(rel, lo, hi) | mp.spawn
+                a.broad |= self.module_rule(rel)
+                a.reasons.append(f"default values {rel}")
+                continue
             elif scope:
                 # class body: attributes, method headers, added or removed methods
                 sp = None
                 if site.kind == "header" and is_pkg and site.new and scope[-1][0] == "class":
-                    sp = _defaults_only(site.nodes[0], site.new[0])
+                    sp = _defaults_span(site.nodes[0], site.new[0])
                 if sp is not None and not mp.has_import_line(rel, sp[0], sp[1]):
                     a.cand |= mp.lines_tests(rel, sp[0], sp[1]) | mp.spawn
                     a.rsafe = False
@@ -2069,10 +2305,27 @@ class Analyzer:
                     a.reasons.append(f"literal default of method {site.nodes[0].name} {rel}, callers only")
                     continue
                 narrow = self.attr_rule(rel, site)
+                if isinstance(narrow, tuple):
+                    cand, imp, keys = narrow
+                    a.cand |= cand
+                    a.imp |= imp & ~cand
+                    a.imp_excuse += keys
+                    a.broad |= self.class_rule(rel, scope)
+                    a.reasons.append(f"attribute read at run time, state check {rel}")
+                    continue
                 if narrow is not None:
                     a.cand |= narrow | mp.spawn
                     a.broad |= self.class_rule(rel, scope)
                     a.reasons.append(f"attribute read at run time {rel}")
+                    continue
+                meth = self.method_rule(rel, site) if is_pkg else None
+                if meth is not None:
+                    cand, imp, keys = meth
+                    a.cand |= cand
+                    a.imp |= imp & ~cand
+                    a.imp_excuse += keys
+                    a.broad |= self.class_rule(rel, scope)
+                    a.reasons.append(f"method header or deletion, state check {rel}")
                     continue
                 nested = self.nested_rule(rel, site) if is_pkg else None
                 if nested is not None:
@@ -2098,7 +2351,7 @@ class Analyzer:
                     site.kind == "header"
                     and isinstance(site.nodes[0], (ast.FunctionDef, ast.AsyncFunctionDef))
                 )
-                sp = _defaults_only(site.nodes[0], site.new[0]) if header_only and is_pkg and site.new else None
+                sp = _defaults_span(site.nodes[0], site.new[0]) if header_only and is_pkg and site.new else None
                 if sp is not None and not mp.has_import_line(rel, sp[0], sp[1]):
                     a.cand |= mp.lines_tests(rel, sp[0], sp[1]) | mp.spawn
                     a.rsafe = False
@@ -2125,13 +2378,7 @@ class Analyzer:
         a.broad |= self.module_rule(rel)
 
 
-def _literal(n) -> bool:
-    if isinstance(n, ast.UnaryOp) and isinstance(n.op, (ast.USub, ast.UAdd)):
-        n = n.operand
-    return isinstance(n, ast.Constant)
-
-
-def _defaults_only(o, n) -> tuple[int, int] | None:
+def _defaults_span(o, n) -> tuple[int, int] | None:
     """Body span of an undecorated function whose header differs only in
     literal default values, None otherwise. A default is read when a call
     binds it, and a call runs the body, so only tests that ran the body can
@@ -2176,6 +2423,94 @@ def _defaults_only(o, n) -> tuple[int, int] | None:
 
 def _docstring(n) -> bool:
     return isinstance(n, ast.Expr) and isinstance(n.value, ast.Constant) and type(n.value.value) is str
+
+
+def _defaults_only(o, n) -> bool:
+    """Two defs that differ only in the values of some defaults, each a
+    literal on both sides; names, decorators, annotations, parameters and
+    which of them have a default are all the same."""
+    if not isinstance(o, (ast.FunctionDef, ast.AsyncFunctionDef)) or type(n) is not type(o):
+        return False
+    oa, na = o.args, n.args
+    if [_dump(x) for x in o.body] != [_dump(x) for x in n.body]:
+        return False
+    if len(oa.defaults) != len(na.defaults) or len(oa.kw_defaults) != len(na.kw_defaults):
+        return False
+    for x, y in zip(oa.defaults + oa.kw_defaults, na.defaults + na.kw_defaults):
+        if (x is None) != (y is None):
+            return False
+        if x is not None and _dump(x) != _dump(y) and not (_literal(x) and _literal(y)):
+            return False
+    oc, nc = _copy(o), _copy(n)
+    for c in (oc, nc):
+        c.args.defaults = []
+        c.args.kw_defaults = [None if x is None else ast.Constant(value=0) for x in c.args.kw_defaults]
+    return _header(oc) == _header(nc) and _header(o) != _header(n)
+
+
+def _reordered_defs(old_tree, new_tree) -> list | None:
+    """The old top-level statements of a module whose patched body only
+    reorders some plain function definitions, or None. Within the reordered
+    stretch every statement on both sides is a def without decorators,
+    defaults are literals, annotations are never evaluated (future
+    annotations) or hold no call, and no def name is bound anywhere else at
+    module level. Then each def only binds its own name to the same function,
+    and the order of those bindings is all that differs."""
+    ob, nb = old_tree.body, new_tree.body
+    if len(ob) != len(nb):
+        return None
+    od = [_dump(x) for x in ob]
+    nd = [_dump(x) for x in nb]
+    if od == nd or sorted(od) != sorted(nd):
+        return None
+    i = 0
+    while od[i] == nd[i]:
+        i += 1
+    j = len(od)
+    while od[j - 1] == nd[j - 1]:
+        j -= 1
+    lazy = _future_annotations(old_tree) and _future_annotations(new_tree)
+    names = set()
+    for n in ob[i:j]:
+        if not isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) or n.decorator_list \
+                or getattr(n, "type_params", None):
+            return None
+        a = n.args
+        for d in a.defaults + [x for x in a.kw_defaults if x is not None]:
+            if not _literal(d):
+                return None
+        if not lazy:
+            anns = [x.annotation for x in a.posonlyargs + a.args + a.kwonlyargs if x.annotation]
+            anns += [x.annotation for x in (a.vararg, a.kwarg) if x is not None and x.annotation]
+            if n.returns is not None:
+                anns.append(n.returns)
+            for e in anns:
+                if any(isinstance(x, (ast.Call, ast.NamedExpr, ast.Await, ast.Yield, ast.YieldFrom))
+                       for x in ast.walk(e)):
+                    return None
+        if n.name in names:
+            return None
+        names.add(n.name)
+    if not lazy:
+        for n in ob[i:j]:
+            a = n.args
+            for e in [x.annotation for x in a.posonlyargs + a.args + a.kwonlyargs] + [n.returns]:
+                if e is not None and any(isinstance(x, ast.Name) and x.id in names for x in ast.walk(e)):
+                    return None
+    for k, n in enumerate(ob):
+        if i <= k < j:
+            continue
+        for x in ast.walk(n):
+            if isinstance(x, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and x.name in names \
+                    and n is x:
+                return None
+            if isinstance(x, ast.Name) and isinstance(x.ctx, (ast.Store, ast.Del)) and x.id in names:
+                return None
+            if isinstance(x, ast.alias) and (x.asname or x.name).split(".")[0] in names:
+                return None
+            if isinstance(x, (ast.Global, ast.Nonlocal)) and names & set(x.names):
+                return None
+    return list(ob[i:j])
 
 
 def _future_annotations(tree) -> bool:
@@ -2540,23 +2875,57 @@ def _conftest_fixtures(text: str) -> dict | None:
                 or (isinstance(f, ast.Name) and f.id == "fixture" and "fixture" in have)):
             return None
         name = n.name
+        auto = False
+        kws: dict = {}
         if call:
             if call.args:
                 return None
             for kw in call.keywords:
                 v = ast.literal_eval(kw.value)
+                kws[kw.arg] = v
                 if kw.arg == "autouse" and v:
-                    return None
+                    auto = True
                 if kw.arg == "name":
                     name = v
                 elif kw.arg not in ("autouse", "scope", "params", "ids"):
                     return None
+        if auto:
+            # an autouse fixture runs around every test under the conftest's
+            # directory; allowed only when what it runs cannot outlast the
+            # test: function scope, no parameters, a body of yield, pass and
+            # gc.collect() (sqlglot holds no weak references or finalizers)
+            if set(kws) - {"autouse", "scope"} or kws.get("scope", "function") != "function" \
+                    or n.args.args or n.args.posonlyargs or n.args.kwonlyargs or n.args.vararg \
+                    or n.args.kwarg or "gc" not in have or not _gc_only(n.body):
+                return None
         for dflt in n.args.defaults + [x for x in n.args.kw_defaults if x is not None]:
             ast.literal_eval(dflt)
-        if not isinstance(name, str):
+        if not isinstance(name, str) or name in out:
             return None
-        out[name] = ast.dump(n)
+        out[name] = ("autouse:" if auto else "") + ast.dump(n)
     return out
+
+
+def _gc_only(body) -> bool:
+    """Statements that only yield, pass or call gc.collect() with no or an
+    integer literal argument."""
+    for k, st in enumerate(body):
+        if k == 0 and _docstring(st):
+            continue
+        if isinstance(st, ast.Pass):
+            continue
+        if not isinstance(st, ast.Expr):
+            return False
+        e = st.value
+        if isinstance(e, ast.Yield) and e.value is None:
+            continue
+        if isinstance(e, ast.Call) and isinstance(e.func, ast.Attribute) and e.func.attr == "collect" \
+                and isinstance(e.func.value, ast.Name) and e.func.value.id == "gc" and not e.keywords \
+                and len(e.args) <= 1 and all(isinstance(x, ast.Constant) and type(x.value) is int
+                                             for x in e.args):
+            continue
+        return False
+    return True
 
 
 _HOOK_ARGS = {"session", "config", "items"}
@@ -3317,13 +3686,29 @@ def child_verify(job: dict, out_path: str):
                     fp = impfp.fingerprint(set(base["loose"]), set(base["skip"]))
                     ex = job.get("imp_excuse") or []
 
-                    def excused(k):
-                        return any(k.startswith(p + ".") for p in ex)
+                    moved = set(job.get("modules") or [])
 
-                    ok = bool(d) and not any(v[:1] in "!?" for v in d.values()) and \
-                        set(d) == set(fp) and all(d[k] == fp[k] or excused(k) for k in d)
+                    def excused(k):
+                        # a class's first line in a patched module moves with
+                        # any line added or removed above it; only source
+                        # lookups (inspect) read it, and they open the file,
+                        # so the tests doing that are candidates already
+                        if k.endswith(".__firstlineno__") and k.split(":")[0] in moved:
+                            return True
+                        # "=key" excuses that one key, "prefix" every key under it
+                        return any(k == p[1:] if p[:1] == "=" else k.startswith(p + ".") for p in ex)
+
+                    # a key only one side has (an excused attribute added or
+                    # deleted) counts as differing, so it must be excused too
+                    ok = bool(d) and not any(v[:1] in "!?" for v in list(d.values()) + list(fp.values())) \
+                        and all(d.get(k) == fp.get(k) or excused(k) for k in set(d) | set(fp))
                     if not ok:
                         diff = sorted(k for k in set(d) | set(fp) if d.get(k) != fp.get(k))
+                        if d and not any(v[:1] in "!?" for v in list(d.values())
+                                                                + list(fp.values())):
+                            # every key the patch changed, for state_readers
+                            with open(out_path + ".fpdiff", "w") as f:
+                                json.dump([k for k in diff if not excused(k)], f)
                         raise ValueError(f"{len(diff)} differ: {diff[:3]} {[fp.get(k) for k in diff[:3]]}")
                 except BaseException as e:  # noqa: BLE001
                     ok = False
@@ -3435,6 +3820,7 @@ def child_verify(job: dict, out_path: str):
             import pytest
 
             col = _Collector(job["limits"])
+            preload_ok = True
             if job.get("freeze"):
                 try:
                     import gc
@@ -3446,15 +3832,21 @@ def child_verify(job: dict, out_path: str):
                     gc.collect()
                     gc.freeze()
                 except BaseException:  # noqa: BLE001
-                    pass  # the test meets the same error and fails
-            args = list(job["ids"]) + [
-                "-q", "--tb=no", "-p", "no:cacheprovider", "-p", "no:randomly", "-o", "addopts=",
-                "--rootdir", farm, "-o", "python_files=test_*.py",
-            ]
-            rc = pytest.main(args, plugins=[col])
-            for nid in job["ids"]:
-                if nid in col.failed or nid not in col.seen:
-                    failed.add(nid)
+                    # the test builds the same generators and meets the same
+                    # error, so keep it selected and skip the 3 s run
+                    preload_ok = False
+            if preload_ok:
+                args = list(job["ids"]) + [
+                    "-q", "--tb=no", "-p", "no:cacheprovider", "-p", "no:randomly", "-o", "addopts=",
+                    "--rootdir", farm, "-o", "python_files=test_*.py",
+                ]
+                rc = pytest.main(args, plugins=[col])
+                for nid in job["ids"]:
+                    if nid in col.failed or nid not in col.seen:
+                        failed.add(nid)
+            else:
+                failed.update(job["ids"])
+                rc = 1
         result = {"failed": sorted(failed), "rc": int(rc)}
         if job.get("proxy"):
             # after pytest, so the proxy cannot change what the tests saw
@@ -3482,6 +3874,12 @@ def child_verify(job: dict, out_path: str):
                 result["imp_err"] = f.read()[:500]
             os.unlink(out_path + ".fperr")
         except OSError:
+            pass
+        try:
+            with open(out_path + ".fpdiff") as f:
+                result["imp_diff"] = json.load(f)
+            os.unlink(out_path + ".fpdiff")
+        except (OSError, ValueError):
             pass
     if all_pid:
         try:
@@ -3783,7 +4181,9 @@ def main():
         # or verify only the heaviest candidates: one broad slow test that
         # passes often sets the whole cost of a small selection
         heavy = None
-        if os.environ.get("BLAST_HEAVY", "1") != "0":
+        # a deleted or renamed package file breaks the dialect loading the
+        # heavy tests start with, so their run would only cost CPU
+        if os.environ.get("BLAST_HEAVY", "1") != "0" and not a.gone:
             for j in (1, 2, 3):
                 if j > len(order) or dur[order[-j]] < HEAVY_MIN_MS:
                     break
@@ -3926,7 +4326,20 @@ def main():
             log(f"{c}: import state {'matches' if imp_ok else 'differs or unchecked'} "
                 f"{(res or {}).get('imp_err', '')}")
             if not imp_ok:
-                out |= set(p["imp"])
+                rd = None
+                if res and "failed" in res and res.get("imp_diff"):
+                    try:
+                        rd = an.state_readers(res["imp_diff"], a.patched)
+                    except Exception as e:  # noqa: BLE001
+                        log(f"{c}: state readers failed ({type(e).__name__}: {e})")
+                        rd = None
+                if rd is None:
+                    out |= set(p["imp"])
+                else:
+                    add = set(bits_list(rd)) & set(p["imp"])
+                    out |= add
+                    log(f"{c}: {len(res['imp_diff'])} import-state keys differ, "
+                        f"{len(add)} of {len(p['imp'])} read them")
         if a.imp_check and not a.full and a.applied and verify_on:
             res2 = res or {}
             bad = set(res2.get("leaf_failed") or [])
