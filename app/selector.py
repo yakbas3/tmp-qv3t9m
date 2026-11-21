@@ -324,6 +324,8 @@ def build_index(root: str) -> dict:
                     rel = os.path.relpath(os.path.join(d, f), root)
                     files[module_name(rel)] = rel
     importers: dict = {}
+    refs: dict = {}
+    strings: set = set()
     for mod, rel in files.items():
         try:
             tree = ast.parse(open(os.path.join(root, rel), encoding="utf-8").read())
@@ -351,7 +353,57 @@ def build_index(root: str) -> dict:
         for t in targets:
             if t in files and t != mod:
                 importers.setdefault(files[t], []).append(rel)
-    return {"importers": {k: sorted(v) for k, v in importers.items()}}
+        _collect_refs(tree, rel, refs, strings)
+    return {"importers": {k: sorted(v) for k, v in importers.items()},
+            "refs": refs, "strings": sorted(strings)}
+
+
+CONST_RE = re.compile(r"^_?[A-Z][A-Z0-9_]{2,}$")
+
+
+def _collect_refs(tree, rel: str, refs: dict, strings: set):
+    """Where constant-style names are read: [file, line, in_function, owner].
+    owner is the last name before the attribute (Tokenizer for
+    tokens.Tokenizer.KEYWORDS), empty for a bare name."""
+
+    def visit(node, in_func: bool):
+        for child in ast.iter_child_nodes(node):
+            f = in_func or isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda))
+            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+                # defaults and decorators are evaluated where the def stands
+                for d in getattr(child, "decorator_list", []):
+                    visit_expr(d, in_func)
+                for d in child.args.defaults + [x for x in child.args.kw_defaults if x is not None]:
+                    visit_expr(d, in_func)
+                for b in (child.body if isinstance(child.body, list) else [child.body]):
+                    visit_expr(b, True) if not isinstance(b, ast.stmt) else visit_stmt(b, True)
+                continue
+            visit_one(child, f)
+            visit(child, f)
+
+    def visit_one(n, in_func):
+        name = None
+        owner = ""
+        if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load):
+            name = n.id
+        elif isinstance(n, ast.Attribute) and isinstance(n.ctx, ast.Load):
+            name = n.attr
+            v = n.value
+            owner = v.id if isinstance(v, ast.Name) else v.attr if isinstance(v, ast.Attribute) else "?"
+        elif isinstance(n, ast.Constant) and isinstance(n.value, str) and CONST_RE.match(n.value):
+            strings.add(n.value)
+        if name and CONST_RE.match(name):
+            refs.setdefault(name, []).append([rel, n.lineno, 1 if in_func else 0, owner])
+
+    def visit_expr(e, in_func):
+        visit_one(e, in_func)
+        visit(e, in_func)
+
+    def visit_stmt(st, in_func):
+        visit_one(st, in_func)
+        visit(st, in_func)
+
+    visit(tree, False)
 
 
 # ---------------------------------------------------------------- AST diff
@@ -496,6 +548,8 @@ class Analyzer:
     def __init__(self, mp: Map, index: dict):
         self.mp = mp
         self.importers = index["importers"]
+        self.refs = index.get("refs", {})
+        self.strings = set(index.get("strings", []))
         self._module_rule: dict = {}
 
     # rules -------------------------------------------------------------
@@ -542,6 +596,67 @@ class Analyzer:
                 if ob is not None:
                     b |= ob
         return b
+
+    def import_dependents(self, site: Site) -> int:
+        """Modules that read the changed names at import time (class bodies like
+        KEYWORDS = {**tokens.Tokenizer.KEYWORDS} then .pop(...)): a change can
+        alter or break their import, so take every test touching them."""
+        mp = self.mp
+        owners = {s[1] for s in site.scope if s[0] == "class"}
+        names = set()
+        for n in site.nodes:
+            if isinstance(n, ast.Assign):
+                names.update(t.id for t in n.targets if isinstance(t, ast.Name))
+            elif isinstance(n, (ast.AnnAssign, ast.AugAssign)) and isinstance(n.target, ast.Name):
+                names.add(n.target.id)
+            elif isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                names.add(n.name)
+        out = 0
+        files = set()
+        for name in names:
+            for f, line, in_func, owner in self.refs.get(name, []):
+                if owners and owner not in owners and owner != "?":
+                    continue  # another class's attribute of the same name
+                if not owners and owner:
+                    continue  # module-level name: importers are in the module rule
+                if not in_func or mp.has_import_line(f, line, line):
+                    files.add(f)
+        for f in files:
+            out |= mp.file_tests(f) | mp.by_file.get(f, 0)
+            m = module_name(f)
+            if m:
+                out |= mp.module_class_tests(m)
+        return out
+
+    def attr_rule(self, rel: str, site: Site) -> int | None:
+        """A class attribute that is only read inside functions at run time:
+        tests that both instantiate the class (or a subclass) and reach a read.
+        None when that cannot be shown, so the caller uses the class rule."""
+        mp = self.mp
+        if site.kind not in ("replace", "insert") or not site.nodes:
+            return None
+        names = set()
+        for n in site.nodes:
+            if isinstance(n, ast.Assign) and all(isinstance(t, ast.Name) for t in n.targets):
+                names.update(t.id for t in n.targets)
+            elif isinstance(n, ast.AnnAssign) and isinstance(n.target, ast.Name):
+                names.add(n.target.id)
+            else:
+                return None
+        mod = module_name(rel)
+        qual = ".".join(s[1] for s in site.scope)
+        inst = mp.class_tests(f"{mod}:{qual}")
+        if inst is None:
+            return None
+        reach = 0
+        for name in names:
+            if not CONST_RE.match(name) or name in self.strings:
+                return None
+            for f, line, in_func, _owner in self.refs.get(name, []):
+                if not in_func or mp.has_import_line(f, line, line):
+                    return None
+                reach |= mp.lines_tests(f, line, line)
+        return inst & reach
 
     def func_rule(self, rel: str, site: Site) -> tuple[int, bool]:
         """Tests reaching the changed statements; flag if the code runs at import."""
@@ -714,7 +829,13 @@ class Analyzer:
                     a.reasons.append(f"import-time code {rel}")
             elif scope:
                 # class body: attributes, method headers, added or removed methods
-                a.cand |= self.class_rule(rel, scope)
+                narrow = self.attr_rule(rel, site)
+                if narrow is not None:
+                    a.cand |= narrow | mp.spawn
+                    a.broad |= self.class_rule(rel, scope)
+                    a.reasons.append(f"attribute read at run time {rel}")
+                    continue
+                a.cand |= self.class_rule(rel, scope) | self.import_dependents(site)
                 if site.kind != "insert":
                     for n in site.nodes:
                         lo, hi = _span(n)
@@ -736,7 +857,7 @@ class Analyzer:
                     # name or decorators changed: anything importing it may break
                     a.cand |= self.module_rule(rel)
                 else:
-                    a.cand |= self.module_rule(rel)
+                    a.cand |= self.module_rule(rel) | self.import_dependents(site)
             a.broad |= mp.file_tests(rel)
         a.broad |= self.module_rule(rel)
 
@@ -1112,9 +1233,6 @@ def main():
     file_cpu = {"tests/test_optimizer.py": 1.4, "tests/test_executor.py": 1.8}
     test_factor = {"tests/test_optimizer.py": 2.5, "tests/test_executor.py": 2.0}
     p_pass = 0.45  # prior that a verified candidate set holds no failure
-    # The model above was timed under local amd64 emulation. The board's
-    # native CPU reads about half of that, so scale the charge down.
-    cpu_scale = float(os.environ.get("BLAST_CPU_SCALE", "0.5"))
     for c in commits:
         a = analyses[c]
         cand = bits_list(a.cand)
@@ -1125,8 +1243,7 @@ def main():
             continue
         # pick a duration threshold: verify everything at or below it
         order = sorted(cand, key=lambda t: dur[t])
-        # demand a margin: the CPU model is rough, a tie is a likely loss
-        best = (base_cost - 250, -1)
+        best = (base_cost, -1)
         files: set = set()
         cpu = per_run_cpu
         for k, t in enumerate(order):
@@ -1141,7 +1258,7 @@ def main():
             biggest = order[k]
             if_pass = pack_cost(rest, dur)
             if_fail = pack_cost(rest + [biggest], dur)
-            est = cpu * cpu_scale * 1000 + p_pass * if_pass + (1 - p_pass) * if_fail
+            est = cpu * 1000 + p_pass * if_pass + (1 - p_pass) * if_fail
             if est < best[0]:
                 best = (est, k)
         if os.environ.get("BLAST_FORCE") == "1":
