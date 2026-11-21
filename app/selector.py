@@ -4794,12 +4794,21 @@ def main():
                 for nid in res["failed"]:
                     if nid in num_of:
                         out.add(num_of[nid])
+        # ablation switch: leave out every test at or above this many ms
+        drop = int(os.environ.get("BLAST_DROP_MS", "0"))
+        if drop:
+            gone = {t for t in range(n) if dur[t] >= drop}
+            if out & gone:
+                log(f"{c}: ablation leaves out {len(out & gone)} slow tests")
+            out = set(out) - gone
+        else:
+            gone = set()
         sel = sorted(out)
         workers, loads, cost = best_pack(sel, dur)
         total += cost
         if workers:
-            extra = [t for t in sorted(bits_list(a.cand | a.broad), key=lambda t: dur[t]) if t not in out]
-            rest = [t for t in sorted(range(n), key=lambda t: dur[t]) if t not in out and not (a.cand | a.broad) >> t & 1]
+            extra = [t for t in sorted(bits_list(a.cand | a.broad), key=lambda t: dur[t]) if t not in out and t not in gone]
+            rest = [t for t in sorted(range(n), key=lambda t: dur[t]) if t not in out and t not in gone and not (a.cand | a.broad) >> t & 1]
             workers = fill_slack(workers, loads, extra + rest, dur)
         workers = [w for w in workers if w]
         print(json.dumps({"commit": c, "workers": workers}), flush=True)
