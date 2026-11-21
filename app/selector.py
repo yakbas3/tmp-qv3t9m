@@ -4668,6 +4668,161 @@ class Verifier:
 # ---------------------------------------------------------------- main
 
 
+# ---------------------------------------------------------------- markers
+# BLAST_MARK=1: a diagnostic build. After the final selection and packing,
+# the busiest worker of a commit grows by exactly W ms, W the sum of the
+# weights of the classes below, so the board total carries the counts.
+MARK_A, MARK_B, MARK_C, MARK_D = 1, 16, 256, 4096
+MARK_MODE = os.environ.get("BLAST_MARK", "")
+
+
+def mark2_tpcds(p, res, in_sel, tpn):
+    """BLAST_MARK=2: (weight, value, reason) for a commit that keeps TPC-DS.
+    1s digit: the risk gate that failed. 16s: the risk sample saw a digest
+    differ (1 front end or test process, 2 worker plan, 3 result table,
+    9 cannot tell). 256s: another stop (1 raise, 2 over CPU or no result,
+    3 the exact replay found a difference first, 9 other)."""
+    g = p.get("risk_gate")
+    if g:
+        return 1, g, f"risk gate {g} failed; tp_path {p.get('tp_path', '')}"
+    if g is None:
+        return 256, 9, "risk gate not evaluated"
+    if not in_sel:
+        return 256, 9, "slack fill only"
+    if tpn not in p.get("proxy", []):
+        return 256, 9, f"risk gate passed but no replay job; tp_path {p.get('tp_path', '')}"
+    if res is None or "failed" not in res:
+        return 256, 2, f"replay job gave no result ({(res or {}).get('error', 'out of time')})"[:160]
+    info = (res.get("proxy_info") or {}).get(TPCDS_ID, {})
+    if TPCDS_ID in (res.get("proxy_ok") or []):
+        return 256, 9, "replay cleared, import state differs"
+    stop = str(info.get("stop", ""))
+    rstop = info.get("risk_stop")
+
+    def exc(s):
+        return 2 if s.startswith("Overtime") else 1
+    if rstop is None:
+        if stop.startswith(REPLAY_COST):
+            # risk_tpcds returned False without a stop: cannot happen
+            return 256, 9, f"risk sample: no stop recorded, exact stop {stop}"
+        if stop.startswith(("main", "worker", "table", "shared tables")):
+            return 256, 3, f"exact replay found a difference: {stop}"
+        if ":" in stop:
+            return 256, exc(stop), f"exact replay raised: {stop}"[:160]
+        return 256, 9, f"exact replay stopped: {stop or 'no info'}"
+    rstop = str(rstop)
+    why = f"risk sample stopped: {rstop} (exact: {stop})"[:200]
+    if rstop.startswith(("main", "pair")):
+        return 16, 1, why
+    if rstop.startswith("worker"):
+        return 16, 2, why
+    if rstop.startswith("table"):
+        return 16, 3, why
+    if rstop.startswith("shared tables"):
+        return 16, 9, why
+    if ":" in rstop:
+        return 256, exc(rstop), why
+    return 256, 9, why
+REPLAY_FOUND = ("main", "worker", "table", "shared tables", "pair")
+REPLAY_COST = ("budget", "cap", "projected", "risk only")
+
+
+def mark_tpcds_class(p, res, in_sel, tpn):
+    """'A', 'B' or 'C' and the reason, for a commit that keeps the TPC-DS test."""
+    if not in_sel:
+        return "B", "slack fill only"
+    if tpn in p.get("proxy", []):
+        if res is None or "failed" not in res:
+            return "B", f"replay out of time or no result ({(res or {}).get('error', 'no result')})"[:160]
+        info = (res.get("proxy_info") or {}).get(TPCDS_ID, {})
+        if TPCDS_ID in (res.get("proxy_ok") or []):
+            return "B", "replay cleared, import state differs"
+        stop = str(info.get("risk_stop") or info.get("stop") or "")
+        if stop.startswith(REPLAY_FOUND):
+            return "C", f"replay did not clear: {stop}"
+        if stop.startswith(REPLAY_COST) or stop in ("setup", "pairs") or not stop:
+            return "B", f"replay stopped: {stop or 'no info'} {info.get('risk_stop', '')}".strip()
+        # a raise or an overtime inside a query: the query fails
+        return "C", f"replay raised: {stop}"[:160]
+    why = p.get("tp_path", "")
+    if why.startswith("not replayable"):
+        return "A", why
+    if why.startswith("replay skipped at planning"):
+        return "B", why
+    return "B", f"other path: {why or 'not a replay candidate'}"
+
+
+def mark_commit(c, a, p, res, sel, workers, ids, dur, n):
+    sel_all = a.full or len(sel) >= n - 5
+    chosen = {t for w in workers for t in w}
+    num = {v: k for k, v in ids.items()}
+    tpn, mxn = num.get(TPCDS_ID), num.get(MAXNODES_ID)
+    cls, notes, w_ms = [], [], 0
+    if not sel_all and tpn is not None and tpn in chosen:
+        if MARK_MODE == "2":
+            wt, v, why = mark2_tpcds(p, res, tpn in sel, tpn)
+            cls.append(f"{wt}x{v}")
+            notes.append(f"tpcds {why}")
+            w_ms += wt * v
+        else:
+            k, why = mark_tpcds_class(p, res, tpn in sel, tpn)
+            cls.append(k)
+            notes.append(f"tpcds {why}")
+            w_ms += {"A": MARK_A, "B": MARK_B, "C": MARK_C}[k]
+    if not sel_all and mxn is not None and mxn in chosen:
+        cls.append("D")
+        notes.append("max_nodes " + ("slack fill only" if mxn not in sel else "selected"))
+        w_ms += MARK_D
+    if w_ms:
+        # free tests below 3 s, largest first, then exact by the many short ones
+        loads = [sum(dur[t] for t in w) for w in workers]
+        top = loads.index(max(loads))
+        # tests outside the selection: unused ones first, then slack fill
+        # sitting on another worker (moved, so the output's test set stays)
+        home = {t: i for i, w in enumerate(workers) for t in w}
+        sel_set = set(sel)
+        pool = sorted((t for t in range(n) if t not in sel_set and home.get(t) != top
+                       and 0 < dur[t] < 3000),
+                      key=lambda t: (-dur[t], t in home, t))
+        pick, left = [], w_ms
+        for t in pool:
+            if dur[t] <= left:
+                pick.append(t)
+                left -= dur[t]
+                if not left:
+                    break
+        if left:
+            # exact subset sum over the pool
+            reach = {0: None}
+            for t in pool:
+                for s in sorted(reach, reverse=True):
+                    s2 = s + dur[t]
+                    if s2 <= w_ms and s2 not in reach:
+                        reach[s2] = (s, t)
+                if w_ms in reach:
+                    break
+            if w_ms in reach:
+                pick, s = [], w_ms
+                while s:
+                    s, t = reach[s]
+                    pick.append(t)
+                left = 0
+        if left:
+            log(f"{c}: mark FAILED, {left} ms short of {w_ms}")
+        else:
+            moved = 0
+            for t in pick:
+                if t in home:
+                    workers[home[t]].remove(t)
+                    moved += 1
+            workers[top].extend(pick)
+            if not all(workers):
+                log(f"{c}: mark emptied a worker")
+            notes.append(f"{len(pick)} markers, {moved} moved from slack")
+    log(f"{c}: mark classes={''.join(cls) or '-'} W={w_ms} "
+        f"{'select everything ' if sel_all else ''}{'; '.join(notes)}")
+
+
 def main():
     if len(sys.argv) > 1 and sys.argv[1] == "--build-index":
         idx = build_index(SRC)
@@ -4859,6 +5014,17 @@ def main():
         # the risk dial: a TPC-DS test no proof will clear gets a sampled replay
         risk = None
         tpn = num_of_id.get(TPCDS_ID)
+        if MARK_MODE == "2":
+            # diagnostic only: the first risk gate below that fails
+            gates = [an.rq is None, not verify_on, a.full, not a.applied,
+                     not (tpn in proxy_nums and tpn in cand), a.gone, a.collect,
+                     not all(r in TPC_FIXTURES or (r.startswith("sqlglot/") and r.endswith(".py"))
+                             for r in a.patched)]
+            g = next((i + 1 for i, f in enumerate(gates) if f), 0)
+            if not g and RISK_BUDGET > 0:
+                rg = pack_cost(cand, dur) - pack_cost([t for t in cand if t != tpn], dur)
+                g = 0 if rg / 1000 > RISK_BUDGET + 1.0 else 9
+            plan[c]["risk_gate"] = g
         if RISK_BUDGET > 0 and an.rq is not None and verify_on and not a.full and a.applied \
                 and tpn in proxy_nums and tpn in cand and not a.gone and not a.collect \
                 and all(r in TPC_FIXTURES or (r.startswith("sqlglot/") and r.endswith(".py"))
@@ -5110,6 +5276,7 @@ def main():
         results = ver.results
 
     num_of = {v: k for k, v in ids.items()}
+    mark_on = MARK_MODE in ("1", "2")
     total = 0
     for c in commits:
         a = analyses[c]
@@ -5213,6 +5380,8 @@ def main():
             rest = [t for t in sorted(range(n), key=lambda t: dur[t]) if t not in out and not (a.cand | a.broad) >> t & 1]
             workers = fill_slack(workers, loads, extra + rest, dur)
         workers = [w for w in workers if w]
+        if mark_on and workers:
+            mark_commit(c, a, p, res, sel, workers, ids, dur, n)
         print(json.dumps({"commit": c, "workers": workers}), flush=True)
     log(f"done, simulated estimate {total / 1000:.1f}s")
 
