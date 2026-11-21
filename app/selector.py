@@ -41,6 +41,34 @@ HEAVY_MIN_MS = 3000  # a candidate this slow may be verified alone
 # collect scans only what the test itself made. Measured 3.7 s to 1.3 s CPU.
 FREEZE_IDS = {"tests/test_generator.py::TestGenerator::test_generator_memory"}
 PROXY_MIN_MS = 3000  # tests cheaper than this are not worth the proxy run
+TPCDS_ID = "tests/test_executor.py::TestExecutor::test_execute_tpcds"
+# CPU seconds the proxy may spend running TPC-DS queries for one commit. A
+# run pays off only when the test is then cleared, which is no better than
+# an even bet, and the test costs 21 s when kept.
+REPLAY_BUDGET = float(os.environ.get("BLAST_REPLAY_BUDGET", "8.0"))
+# The risk dial, off by default. When above 0, a test_execute_tpcds that no
+# proof clears gets a sampled replay of up to this many CPU seconds
+# (proxy.risk_tpcds, queries in risk_order): no sign of failure in the
+# sample and the test is left out. Not a proof: a failure that shows only in
+# queries the sample did not reach is missed.
+RISK_BUDGET = float(os.environ.get("BLAST_TPCDS_RISK", "0"))
+RISK_ORDER = os.environ.get("BLAST_TPCDS_RISK_ORDER", "targeted")
+# Off by default, not a proof: test_max_nodes (29 s) checked by a stand-in
+# that runs its body at 1/25 scale (max_nodes_standin).
+STANDIN_ON = os.environ.get("BLAST_STANDIN", "0") == "1"
+MAXNODES_ID = "tests/test_parser.py::TestParser::test_max_nodes"
+STANDIN_CPU = 1.5  # what the stand-in costs on the pinned tree, CPU s
+# Off: r_class does not yet follow a class attribute read through a class
+# object (self.dialect.tokenizer_class.NUMERIC_ESCAPES, cls.TRANSFORMS), so
+# it can clear a TPC test that reads the change.
+R_CLASS_ON = os.environ.get("BLAST_R_CLASS") == "1"
+# fixture files test_execute_tpcds reads: setUpClass loads both, the test
+# uses the TPC-DS pairs' meta and SQL
+# the tests proxy.py replays
+TPC_IDS = ("tests/test_executor.py::TestExecutor::test_execute_tpcds",
+           "tests/test_executor.py::TestExecutor::test_execute_tpch",
+           "tests/test_executor.py::TestExecutor::test_optimized_tpch")
+TPC_FIXTURES = {"tests/fixtures/optimizer/tpc-ds/tpc-ds.sql", "tests/fixtures/optimizer/tpc-h/tpc-h.sql"}
 
 CONFIG_FILES = {"pyproject.toml", "setup.cfg", "pytest.ini", "tox.ini", "conftest.py", "setup.py",
                 ".pytest.ini", "pytest.toml", ".pytest.toml"}
@@ -61,6 +89,34 @@ class FileDiff:
         self.binary = False
 
 
+def _shadows(rel: str) -> bool:
+    """A new .py file that takes the place of something importable today: a
+    package directory beside a module of its name (or the reverse), an
+    __init__.py in a directory that exists, or a name the standard library
+    or an installed package owns, in a directory that is not a package."""
+    import importlib.util
+
+    stem = rel[:-3]
+    d, base = os.path.split(stem)
+    if base == "__init__":
+        if os.path.isfile(os.path.join(SRC, d + ".py")) or os.path.isdir(os.path.join(SRC, d)):
+            return True
+        name, top = os.path.basename(d), os.path.dirname(d)
+    else:
+        if os.path.isdir(os.path.join(SRC, stem)):
+            return True
+        name, top = base, d
+    if not os.path.isfile(os.path.join(SRC, top, "__init__.py")):
+        if name in sys.stdlib_module_names:
+            return True
+        try:
+            if importlib.util.find_spec(name) is not None:
+                return True
+        except Exception:  # noqa: BLE001
+            return True
+    return False
+
+
 def _strip_prefix(path: str) -> str | None:
     path = path.split("\t")[0].strip()
     if path == "/dev/null":
@@ -75,10 +131,21 @@ def _strip_prefix(path: str) -> str | None:
 HUNK_RE = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
 
 
+def _lines(text: str) -> list[str]:
+    """Lines as git and patch see them: only "\n" ends one. str.splitlines
+    also splits on form feed, \x1c to \x1e, \x85 and the Unicode line and
+    paragraph separators, which would cut a hunk line in two."""
+    parts = text.split("\n")
+    out = [x + "\n" for x in parts[:-1]]
+    if parts[-1]:
+        out.append(parts[-1])
+    return out
+
+
 def parse_patch(text: str) -> list[FileDiff]:
     files: list[FileDiff] = []
     cur = None
-    lines = text.splitlines(keepends=True)
+    lines = _lines(text)
     i = 0
     while i < len(lines):
         line = lines[i]
@@ -154,10 +221,15 @@ def parse_patch(text: str) -> list[FileDiff]:
 
 
 def apply_hunks(old: str, hunks) -> str | None:
-    src = old.splitlines(keepends=True)
+    src = _lines(old)
     out: list[str] = []
     pos = 0
     for os_, ol, ns, nl, body in hunks:
+        # a hunk shorter than its header says was cut off while parsing:
+        # what it leaves out is unknown, so it does not apply
+        if sum(1 for l in body if l[:1] in (" ", "-")) != ol \
+                or sum(1 for l in body if l[:1] in (" ", "+")) != nl:
+            return None
         want = [l[1:] for l in body if l[:1] in (" ", "-")]
         repl = [l[1:] for l in body if l[:1] in (" ", "+")]
         start = os_ - 1 if ol > 0 else os_
@@ -324,6 +396,151 @@ class Map:
         if not s:
             return False
         return any(l in s for l in range(lo, hi + 1))
+
+
+class RQ:
+    """What the TPC executor tests reach outside the proxied front end
+    (tools/rq_build.py). Bit i stands for the worker's run of TPC-DS query
+    i, bit nq for the rest of the three tests."""
+
+    def __init__(self, path: str):
+        m = json.loads(gzip.decompress(open(path, "rb").read()))
+        self.nq = int(m["nq"])
+        self.rest = 1 << self.nq
+        self.all = (1 << (self.nq + 1)) - 1
+        self.cost = [float(c) for c in m["cost"]]
+        sets = [int(x, 16) for x in m["sets"]]
+        self.lines = {f: ([p[0] for p in v], [sets[p[1]] for p in v]) for f, v in m["lines"].items()}
+        self.types = {k: sets[v] for k, v in m["types"].items()}
+        # per query, the lines its front end (proxy.Replay.front) reaches,
+        # and what recomputing that front end costs (tools/rq_front.py)
+        self.front = None
+        if "front" in m:
+            self.front = {f: ([p[0] for p in v], [sets[p[1]] for p in v]) for f, v in m["front"].items()}
+        self.fcost = [float(c) for c in m.get("fcost", [0.0] * self.nq)]
+        self._files: dict = {}
+
+    def line_bits(self, f: str, lo: int, hi: int, front: bool = False) -> int:
+        c = (self.front if front else self.lines).get(f)
+        if c is None:
+            return 0
+        lns, bits = c
+        out = 0
+        i = bisect.bisect_left(lns, lo)
+        while i < len(lns) and lns[i] <= hi:
+            out |= bits[i]
+            i += 1
+        return out
+
+    def file_bits(self, f: str) -> int:
+        b = self._files.get(f)
+        if b is None:
+            b = 0
+            for x in self.lines.get(f, ((), ()))[1]:
+                b |= x
+            self._files[f] = b
+        return b
+
+    def type_bits(self, key: str) -> int:
+        return self.types.get(key, 0)
+
+    def module_type_bits(self, module: str) -> int:
+        out = 0
+        prefix = module + ":"
+        for k, b in self.types.items():
+            if k.startswith(prefix):
+                out |= b
+        return out
+
+    def queries(self, bits: int) -> list:
+        return [i for i in range(self.nq) if bits >> i & 1]
+
+
+def max_nodes_standin(width: int = 400, slow: float = 4.0) -> bool:
+    """test_parser.py::TestParser::test_max_nodes at width/10000 of its
+    size, the node limits scaled with it (1,000,000 and 50,000 nodes for
+    10,000 columns become 100 and 5 per column). Same statements, same
+    depth (100), same messages; a fifth of a second of tokenizing instead
+    of 12. Fails on any assertion, and when it takes over `slow` CPU
+    seconds (2.5 times the pinned tree): the real test parses 25 times as
+    much and could time out. Not a proof (see the report): a change that
+    shows only past this size passes here."""
+    import resource
+
+    from sqlglot import exp, parse_one
+    from sqlglot.errors import ParseError
+
+    def cpu():
+        r = resource.getrusage(resource.RUSAGE_SELF)
+        return r.ru_utime + r.ru_stime
+
+    c0 = cpu()
+    try:
+        if not isinstance(parse_one("SELECT 1", max_nodes=1_000_000), exp.Select):
+            return False
+        cols = [f"col{i}" for i in range(500)]
+        if not isinstance(parse_one(f"SELECT {','.join(cols)} FROM t", max_nodes=1_000_000), exp.Select):
+            return False
+        expr = "x" + "=x" * 100
+        sql = f"SELECT {','.join([expr] * width)}"
+        for lim in (100 * width, 5 * width):
+            try:
+                parse_one(sql, max_nodes=lim)
+                return False
+            except ParseError as e:
+                if "Maximum number of AST nodes" not in str(e) or f"({lim})" not in str(e):
+                    return False
+        try:
+            parse_one("SELECT " + ",".join(f"x={i}" for i in range(100)), max_nodes=5)
+            return False
+        except ParseError:
+            pass
+        if not isinstance(parse_one("SELECT 1, 2, 3"), exp.Select):
+            return False
+    except BaseException:  # noqa: BLE001
+        return False
+    return cpu() - c0 <= slow
+
+
+_DIVERSE: dict = {}
+
+
+def risk_order(rq: RQ, need, front, kind: str = "targeted") -> list:
+    """TPC-DS queries in the order the risk dial samples them. "cheap":
+    cheapest front end and run first. "diverse": greedy, the query whose
+    run and front end reach the most lines no earlier query reached, per
+    CPU second. "targeted": the queries whose run reaches a change (need),
+    then those whose front end may (front, None for every one), each
+    cheapest first, then the rest in the diverse order."""
+    n = rq.nq
+    price = [rq.cost[i] + rq.fcost[i] + 0.01 for i in range(n)]
+    if kind == "cheap":
+        return sorted(range(n), key=lambda i: (price[i], i))
+    div = _DIVERSE.get(id(rq))
+    if div is None:
+        cover: list = [set() for _ in range(n)]
+        for src in (rq.lines, rq.front or {}):
+            for f, (lns, bits) in src.items():
+                for ln, b in zip(lns, bits):
+                    for i in range(n):
+                        if b >> i & 1:
+                            cover[i].add((f, ln))
+        seen: set = set()
+        left = set(range(n))
+        div = []
+        while left:
+            best = max(left, key=lambda i: (len(cover[i] - seen) / price[i], -i))
+            div.append(best)
+            seen |= cover[best]
+            left.discard(best)
+        _DIVERSE[id(rq)] = div
+    if kind == "diverse":
+        return list(div)
+    out: list = sorted(set(need), key=lambda i: (price[i], i))
+    fr = set(range(n)) if front is None else set(front)
+    out += sorted(fr - set(out), key=lambda i: (price[i], i))
+    done = set(out)
+    return out + [i for i in div if i not in done]
 
 
 # ---------------------------------------------------------------- import graph
@@ -587,6 +804,10 @@ def _call_name(c) -> str:
 
 
 CONST_RE = re.compile(r"^_?[A-Z][A-Z0-9_]{2,}$")
+# class attributes read only to fill a cache that outlives the test which
+# filled it (generator._build_dispatch, cached per class in _DISPATCH_CACHE):
+# later tests see them without running the line that names them
+_CACHED_READS = {"TRANSFORMS"}
 
 
 def _rebinds(tree, name: str) -> bool:
@@ -891,7 +1112,14 @@ class Analysis:
         self.patched: dict = {}  # rel path -> new text or None (deleted)
         self.applied = True
         self.sqlglot_modules: list = []  # changed importable sqlglot modules
-        self.rsafe = True  # every change is a function body the proxy covers
+        self._rsafe = True  # every change is a function body the proxy covers
+        self.rsafe_why = ""  # where it first turned False, for the log
+        self.rq = 0  # parts of the TPC tests that reach a change outside the front end (see RQ)
+        self.tpcds_only = False
+        # TPC-DS queries whose front end may reach a change; fq_all: any
+        self.fq = 0
+        self.fq_all = False  # a TPC fixture changed: only the TPC-DS proxy reads it as the test does
+        self.gone = False  # a package file was deleted or renamed
         self.imp = 0  # tests that can see the change only through import-time state
         # impfp keys a nested class change may alter (see nested_rule); only
         # honoured while every import-time doubt comes from that rule
@@ -903,6 +1131,21 @@ class Analysis:
         # a package module changed outside function bodies: its import runs
         # the change, and a module that no longer imports fails every test
         self.imp_check = False
+        self.imp_order = False  # an import statement changed: load order can matter
+
+
+def _get_rsafe(self):
+    return self._rsafe
+
+
+def _set_rsafe(self, v):
+    if self._rsafe and not v:
+        f = sys._getframe(1)
+        self.rsafe_why = f"{f.f_code.co_name}:{f.f_lineno}"
+    self._rsafe = v
+
+
+Analysis.rsafe = property(_get_rsafe, _set_rsafe)
 
 
 def leak_rule(a: Analysis, rel: str, old_tree, new_tree, sites):
@@ -921,7 +1164,7 @@ def leak_rule(a: Analysis, rel: str, old_tree, new_tree, sites):
 
 
 class Analyzer:
-    def __init__(self, mp: Map, index: dict, rlines: dict | None = None):
+    def __init__(self, mp: Map, index: dict, rlines: dict | None = None, rq: RQ | None = None):
         self.mp = mp
         self.importers = index["importers"]
         self.refs = index.get("refs", {})
@@ -930,6 +1173,9 @@ class Analyzer:
         self._module_rule: dict = {}
         # lines the TPC executor tests run outside the proxied front end
         self.rlines = rlines
+        # the same, per TPC-DS query; without it every reach counts for the whole test
+        self.rq = rq
+        self.r_rest = rq.rest if rq is not None else 1
         self.edges = index.get("edges")
         self.eager = set(index["eager"]) if "eager" in index else None
         self.mentions = index.get("mentions", {})
@@ -987,6 +1233,9 @@ class Analyzer:
                     seen.add(imp)
                     queue.append(imp)
         return b
+
+    def _name_known(self, name: str) -> bool:
+        return name in self.refs or name in self.strings
 
     def mention_tests(self, word: str) -> int:
         mp = self.mp
@@ -1146,6 +1395,11 @@ class Analyzer:
         pat = re.compile(r"\b(" + "|".join(re.escape(n) for n in sorted(names)) + r")\b")
         out = 0
         prefix = d + "/" if d else ""
+        if any(v.startswith("autouse:") for k in names for v in (of.get(k, ""), nf.get(k, ""))):
+            # every test collected under the directory runs it
+            for f, b in self.mp.by_file.items():
+                if f.startswith(prefix):
+                    out |= b
         for root, dirs, files in os.walk(os.path.join(SRC, d)):
             dirs[:] = [x for x in dirs if x not in ("__pycache__", "fixtures")]
             for f in files:
@@ -1247,7 +1501,7 @@ class Analyzer:
                         text = open(path, encoding="utf-8", errors="replace").read()
                         if not pat.search(text):
                             continue
-                        b = self._meta_file(r, ast.parse(text), words)
+                        b = self._meta_file(r, ast.parse(text), words, kind)
                         if b is None:
                             out = None
                             raise StopIteration
@@ -1260,7 +1514,93 @@ class Analyzer:
         cache[kind] = out
         return out
 
-    def _meta_file(self, rel: str, tree, words) -> int | None:
+    def worker_unloaded(self, rel: str) -> bool:
+        """Whether rel is a module the TPC-DS pool workers never load on the
+        pinned tree (app/wmods.json, tools/wm_sitecustomize.py). Nothing in
+        it then runs there or shapes what runs there, whatever the change
+        to it, as long as the worker still does not load it. Only a changed
+        line that a worker runs could make it load the module, and the
+        replay runs every query reaching such a line on the patched tree."""
+        wm = self.__dict__.get("_wmods", 0)
+        if wm == 0:
+            try:
+                wm = set(json.load(open(os.path.join(APP, "wmods.json"))))
+            except Exception:  # noqa: BLE001
+                wm = None
+            self._wmods = wm
+        mod = module_name(rel)
+        return bool(wm) and rel.startswith("sqlglot/") and mod is not None and mod not in wm
+
+    def no_run_reach(self, a: Analysis, rel: str):
+        """A change outside function bodies the rules cannot place in the
+        TPC run: replayable only when the workers never load rel, and then
+        through every front end."""
+        if self.worker_unloaded(rel):
+            a.fq_all = True
+        else:
+            a.rsafe = False
+
+    def _defaults_site(self, rel: str, site: Site) -> tuple | None:
+        """Body span of a def whose header change is only literal default
+        values, when analyze_py takes it as callers only (the two
+        branches for "default values" and "literal default of method"
+        below); None otherwise."""
+        if site.kind != "header" or not site.new or len(site.nodes) != 1:
+            return None
+        o, n = site.nodes[0], site.new[0]
+        mp = self.mp
+        if _defaults_only(o, n) and not mp.has_import_line(rel, o.body[0].lineno, o.end_lineno):
+            live = [x for x in o.body if _has_line_event(x)]
+            if not live:
+                return None
+            return live[0].lineno, o.end_lineno
+        if site.scope and site.scope[-1][0] == "class":
+            sp = _defaults_span(o, n)
+            if sp is not None and not mp.has_import_line(rel, sp[0], sp[1]):
+                return sp
+        return None
+
+    def tpc_span(self, rel: str, lo: int, hi: int) -> tuple:
+        """(run bits, front bits or None for every front) of the TPC-DS
+        queries running a line of rel in lo..hi (see RQ)."""
+        rq = self.rq
+        if rq is None:
+            return self.r_rest, None
+        fb = None if rq.front is None else rq.line_bits(rel, lo, hi, front=True)
+        return rq.line_bits(rel, lo, hi), fb
+
+    def meta_tpc(self, kinds) -> tuple | None:
+        """What a docstring or annotation edit means for the TPC replay:
+        (run bits, front bits or None for every front) over the lines that
+        read __doc__ or the annotations, as RQ records them. The edit
+        changes nothing else, so the replay sees it exactly where those
+        lines run. None when a TPC test is among the readers."""
+        rq = self.rq
+        if rq is None:
+            return None
+        tpc = 0
+        for tid in TPC_IDS:
+            k = self.mp.num_of_id.get(tid)
+            if k is not None:
+                tpc |= 1 << k
+        rbits, fbits = 0, 0
+        for kind in kinds:
+            r = self.meta_readers(kind)
+            if r is None or r & tpc:
+                return None
+            for f, line in self.__dict__.get("_meta_where", {}).get(kind, []):
+                if line is None:
+                    # a test file reading it at import: its own tests only,
+                    # in readers, and none of them is a TPC test
+                    continue
+                rbits |= rq.line_bits(f, line, line)
+                if rq.front is None:
+                    fbits = None
+                elif fbits is not None:
+                    fbits |= rq.line_bits(f, line, line, front=True)
+        return rbits, fbits
+
+    def _meta_file(self, rel: str, tree, words, kind: str = "") -> int | None:
         """Tests reaching the uses of words in one file. A use inside a
         function counts for the tests running that line; a use the import
         runs counts for the file's own tests when it is a test file, and
@@ -1276,6 +1616,10 @@ class Analyzer:
             elif isinstance(node, ast.Assign) and all(isinstance(t, ast.Attribute) and t.attr == "__doc__"
                                                        for t in node.targets):
                 skip.update(id(x) for x in ast.walk(node))
+        if kind == "sig":
+            skip |= _names_only_introspection(tree)
+        # where each use sits, for the TPC replay (meta_tpc)
+        where = self.__dict__.setdefault("_meta_where", {}).setdefault(kind, [])
         out = 0
 
         def visit(node, fn):
@@ -1299,8 +1643,10 @@ class Analyzer:
                     line = getattr(hit, "lineno", None) or getattr(node, "lineno", None)
                     if f is not None and line is not None and not mp.has_import_line(rel, line, line):
                         out |= mp.lines_tests(rel, line, line)
+                        where.append((rel, line))
                     elif rel.startswith("tests/"):
                         out |= self.module_rule(rel)
+                        where.append((rel, None))
                     else:
                         return False
                 if visit(ch, f) is False:
@@ -1444,6 +1790,113 @@ class Analyzer:
         if not lines:
             return False
         return any(l in lines for lo, hi in self.site_spans(site) for l in range(lo, hi + 1))
+
+    def r_bits(self, rel: str, site: Site) -> int:
+        """Parts of the TPC tests (see RQ) that may reach this change in a
+        function body outside the front end."""
+        rq = self.rq
+        if rq is None:
+            return self.r_rest if self.r_hit(rel, site) else 0
+        out = 0
+        for lo, hi in self.site_spans(site):
+            out |= rq.line_bits(rel, lo, hi)
+        return out
+
+    def f_bits(self, rel: str, site: Site) -> int | None:
+        """TPC-DS queries whose front end may run this changed function
+        body. None when there is no per-query front evidence."""
+        rq = self.rq
+        if rq is None or rq.front is None:
+            return None
+        out = 0
+        for lo, hi in self.site_spans(site):
+            out |= rq.line_bits(rel, lo, hi, front=True)
+        return out
+
+    def f_const(self, site: Site) -> int | None:
+        """The same for a module constant const_rule accepted: the front
+        ends that run a line reading it."""
+        rq = self.rq
+        if rq is None or rq.front is None or self.from_names is None:
+            return None
+        out = 0
+        for n in list(site.nodes) + list(site.new or []):
+            name = n.targets[0].id if isinstance(n, ast.Assign) else n.target.id
+            for f, line, _in_func, owner, *_ in self.refs.get(name, []):
+                if owner in ("self", "cls") and name not in self.from_names:
+                    continue
+                out |= rq.line_bits(f, line, line, front=True)
+        return out
+
+    def r_static(self, rel: str, site: Site, cr) -> int | None:
+        """Parts of the TPC tests (see RQ) that may see, outside the front
+        end, a change that is in no function body: a module constant (cr is
+        const_rule's answer) through the lines that read it, a class body
+        through the class. None when that cannot be shown."""
+        rq = self.rq
+        if rq is None:
+            return None
+        if not site.scope:
+            if cr is None or self.from_names is None:
+                return None
+            out = 0
+            for n in list(site.nodes) + list(site.new or []):
+                name = n.targets[0].id if isinstance(n, ast.Assign) else n.target.id
+                for f, line, _in_func, owner, *_ in self.refs.get(name, []):
+                    if owner in ("self", "cls") and name not in self.from_names:
+                        continue
+                    out |= rq.line_bits(f, line, line)
+            return out
+        if not R_CLASS_ON or any(sc[0] != "class" for sc in site.scope):
+            return None
+        return self.r_class(rel, site, set())
+
+    def r_class(self, rel: str, site: Site, seen: set) -> int:
+        """The class rule, the attribute rules and the import readers, taken
+        together and without their narrowing, over the TPC evidence: the
+        parts that run a line of the class, hold an instance of it, of a
+        subclass or of an outer class, run a line that reads a nested
+        class's changed name, or touch a module whose import reads it."""
+        rq, mp = self.rq, self.mp
+        scope = site.scope
+        mod = module_name(rel)
+        if not mod or not rel.startswith("sqlglot/"):
+            return rq.all
+        lo, hi = _span(scope[-1][2])
+        out = rq.line_bits(rel, lo, hi)
+        for k in range(len(scope), 0, -1):
+            key = f"{mod}:{'.'.join(sc[1] for sc in scope[:k])}"
+            if mp.class_tests(key) is None:
+                if k == len(scope):
+                    return rq.all  # a class the map cannot follow: the module rule
+                continue
+            out |= rq.type_bits(key)
+        for lo, hi in self.site_spans(site):
+            out |= rq.line_bits(rel, lo, hi)
+        if len(scope) > 1:
+            for n in list(site.nodes) + list(site.new or []):
+                names = []
+                if isinstance(n, ast.Assign):
+                    names = [t.id for t in n.targets if isinstance(t, ast.Name)]
+                elif isinstance(n, (ast.AnnAssign, ast.AugAssign)) and isinstance(n.target, ast.Name):
+                    names = [n.target.id]
+                elif isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                    names = [n.name]
+                for name in names:
+                    for f, line, _in_func, _owner, *_ in self.refs.get(name, []):
+                        out |= rq.line_bits(f, line, line)
+        for f, line in sorted(self._import_refs(site, rel)):
+            if (f, line) in seen:
+                continue
+            seen.add((f, line))
+            m2 = module_name(f)
+            if len(seen) > 64 or not f.startswith("sqlglot/") or not m2:
+                return rq.all
+            out |= rq.file_bits(f) | rq.module_type_bits(m2)
+            dep = self._class_stmt(f, line)
+            if dep is not None:
+                out |= self.r_class(f, dep, seen)
+        return out
 
     def _foreign_class(self, rel: str, via: list) -> bool:
         """Whether a reference mod.Cls.<...>.NAME names a class that module
@@ -1691,7 +2144,8 @@ class Analyzer:
         if site.kind not in ("replace", "insert") or not site.nodes:
             return None
         names = set()
-        for n in site.nodes:
+        # the patched statements too: an assignment may now bind another name
+        for n in list(site.nodes) + list(site.new or []):
             if isinstance(n, ast.Assign) and all(isinstance(t, ast.Name) for t in n.targets):
                 names.update(t.id for t in n.targets)
             elif isinstance(n, ast.AnnAssign) and isinstance(n.target, ast.Name):
@@ -1704,14 +2158,211 @@ class Analyzer:
         if inst is None:
             return None
         reach = 0
+        at_import = False
         for name in names:
-            if not CONST_RE.match(name) or name in self.strings:
+            if not CONST_RE.match(name) or name in self.strings or name in _CACHED_READS:
                 return None
             for f, line, in_func, _owner, *_ in self.refs.get(name, []):
-                if not in_func or mp.has_import_line(f, line, line):
+                if not in_func:
                     return None
+                if mp.has_import_line(f, line, line):
+                    at_import = True
                 reach |= mp.lines_tests(f, line, line)
-        return inst & reach
+        if not at_import:
+            return inst & reach
+        return self.attr_state_rule(rel, site, reach)
+
+    def state_readers(self, keys: list, patched: dict) -> int | None:
+        """Tests that can read what the import left behind at these impfp
+        keys (class attributes whose digest differs from the pinned tree's).
+        The digests cover everything the imports leave reachable from module
+        globals, so once the import ran, a test sees the difference only by
+        reading one of these attributes, on the class, a subclass or an
+        instance: a line that names it, in a test that touches the class or
+        names its module (a nested class: or instantiates it). None for a
+        module global, a class's bases, a name built or looked up as a
+        string, or a class this cannot find."""
+        mp = self.mp
+        out = mp.spawn
+        for k in keys:
+            mod, _, path = k.partition(":")
+            if "." not in path:
+                return None
+            qual, name = path.rsplit(".", 1)
+            if not CONST_RE.match(name) or name in self.strings or name in _CACHED_READS:
+                return None
+            base = mod.replace(".", "/")
+            rel = next((r for r in (base + ".py", base + "/__init__.py")
+                        if os.path.isfile(os.path.join(SRC, r))), None)
+            if rel is None or rel in patched and patched[rel] is None:
+                return None
+            text = patched.get(rel) or open(os.path.join(SRC, rel), encoding="utf-8").read()
+            body = ast.parse(text).body
+            scope: tuple = ()
+            for part in qual.split("."):
+                hit = [n for n in body if isinstance(n, ast.ClassDef) and n.name == part]
+                if len(hit) != 1:
+                    return None
+                scope = scope + (("class", part, hit[0]),)
+                body = hit[0].body
+            if rel in patched:
+                # the class_rule spans are pinned-tree lines
+                tree = ast.parse(open(os.path.join(SRC, rel), encoding="utf-8").read())
+                body = tree.body
+                old_scope: tuple = ()
+                for part in qual.split("."):
+                    hit = [n for n in body if isinstance(n, ast.ClassDef) and n.name == part]
+                    if len(hit) != 1:
+                        return None
+                    old_scope = old_scope + (("class", part, hit[0]),)
+                    body = hit[0].body
+                scope = old_scope
+            reach = 0
+            for f, line, *_ in self.refs.get(name, []):
+                reach |= mp.lines_tests(f, line, line)
+            word = os.path.basename(rel)[:-3].lower()
+            if word == "__init__":
+                word = os.path.basename(os.path.dirname(rel)).lower()
+            near = self.class_rule(rel, scope) | self.mention_tests(word)
+            out |= reach & near
+            if len(scope) > 1:
+                inst = mp.class_tests(f"{mod}:{qual}")
+                if inst is None:
+                    return None
+                out |= inst
+        return out
+
+    def method_rule(self, rel: str, site: Site) -> tuple | None:
+        """A method deleted from a class body, or a method whose header
+        (decorators, parameters) changed under the same name. A test sees
+        it at run time by looking the name up on the class, a subclass or an
+        instance. A lookup that called the pinned method ran its body (a
+        wrapper from a decorator may stop before the body: the decorator's
+        own code counts too); a line naming it counts as well. What the
+        class body left behind at import is compared with the pinned
+        tree's, the method itself excused. None for a new method name (a
+        lookup that found nothing, or a base's method, runs no line of it),
+        a name used as a string, a read at import, or a decorator this
+        cannot trace."""
+        mp = self.mp
+        scope = site.scope
+        if not scope or any(sc[0] != "class" for sc in scope):
+            return None
+        old = list(site.nodes)
+        new = list(site.new or [])
+        if site.kind == "header":
+            if len(old) != 1 or len(new) != 1 or old[0].name != new[0].name:
+                return None
+        elif site.kind != "replace" or new:
+            return None  # an insert, or a replacement that is not one to one
+        defs = (ast.FunctionDef, ast.AsyncFunctionDef)
+        if not old or not all(isinstance(n, defs) for n in old + new):
+            return None
+        mod = module_name(rel)
+        qual = ".".join(sc[1] for sc in scope)
+        base = os.path.basename(rel)[:-3].lower()
+        near = self.class_rule(rel, scope) | self.mention_tests(base)
+        cand = mp.spawn
+        for lo, hi in self.site_spans(site):
+            cand |= mp.lines_tests(rel, lo, hi)
+        names = set()
+        for n in old + new:
+            names.add(n.name)
+            lo, hi = _span(n)
+            if n in old:
+                cand |= mp.lines_tests(rel, lo, hi)
+            for dec in n.decorator_list:
+                sp = self._decorator_span(rel, dec)
+                if sp is None:
+                    return None
+                if sp:
+                    cand |= mp.lines_tests(sp[0], sp[1], sp[2]) & near
+        for name in names:
+            if name in self.strings or name.startswith("__"):
+                return None
+            for f, line, in_func, *_ in self.refs.get(name, []):
+                if not in_func:
+                    return None
+                cand |= mp.lines_tests(f, line, line) & near
+        return cand, self.class_rule(rel, scope), sorted({f"={mod}:{qual}.{x}" for x in names})
+
+    def _decorator_span(self, rel: str, dec):
+        """(file, first, last line) of the code a decorator runs around
+        calls, () for one that keeps the function (staticmethod,
+        classmethod, property, typing.overload), None when unknown."""
+        f = dec.func if isinstance(dec, ast.Call) else dec
+        if isinstance(dec, ast.Call) and not all(_literal(x) for x in list(dec.args) +
+                                                 [k.value for k in dec.keywords]):
+            return None
+        if isinstance(f, ast.Name) and f.id in ("staticmethod", "classmethod", "property") \
+                and not isinstance(dec, ast.Call):
+            return ()
+        if isinstance(f, ast.Attribute) and f.attr == "overload" and isinstance(f.value, ast.Name) \
+                and f.value.id in ("t", "typing") and not isinstance(dec, ast.Call):
+            return ()
+        if not isinstance(f, ast.Name):
+            return None
+        tree = ast.parse(open(os.path.join(SRC, rel), encoding="utf-8").read())
+        target = None
+        for n in tree.body:
+            if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name == f.id:
+                target = (rel, n)
+            elif isinstance(n, ast.ImportFrom) and n.level == 0 and n.module and n.module.startswith("sqlglot"):
+                for al in n.names:
+                    if (al.asname or al.name) == f.id:
+                        mb = n.module.replace(".", "/")
+                        for r in (mb + ".py", mb + "/__init__.py"):
+                            if os.path.isfile(os.path.join(SRC, r)):
+                                t2 = ast.parse(open(os.path.join(SRC, r), encoding="utf-8").read())
+                                hit = [x for x in t2.body if isinstance(x, (ast.FunctionDef, ast.AsyncFunctionDef))
+                                       and x.name == al.name]
+                                if len(hit) == 1:
+                                    target = (r, hit[0])
+                                break
+        if target is None:
+            return None
+        lo, hi = _span(target[1])
+        return (target[0], lo, hi)
+
+    def attr_state_rule(self, rel: str, site: Site, reach: int) -> tuple | None:
+        """attr_rule when a function the imports run reads the name (a parser
+        line some module's class body reaches while it parses a template).
+        What the import leaves behind is compared with the pinned tree's
+        (impfp.py), with only the changed attributes themselves excused;
+        if it matches, a test sees the new value only by reading it at run
+        time, on the class, a subclass or an instance. Such a read runs a
+        line that names the attribute, in a test that touches the class or
+        names its module. Only for a top-level class of the package, with
+        literal values. Returns (candidates, import-state tests, excused
+        impfp keys), or None."""
+        mp = self.mp
+        scope = site.scope
+        if len(scope) != 1 or scope[0][0] != "class" or not rel.startswith("sqlglot/"):
+            return None
+        names = []
+        for n in list(site.nodes) + list(site.new or []):
+            if isinstance(n, ast.Assign) and all(isinstance(t, ast.Name) for t in n.targets):
+                names += [t.id for t in n.targets]
+            elif isinstance(n, ast.AnnAssign) and isinstance(n.target, ast.Name) and n.value is not None:
+                names.append(n.target.id)
+            else:
+                return None
+            if not _literal(n.value):
+                return None
+        for name in names:
+            if not CONST_RE.match(name) or name in self.strings or name in _CACHED_READS:
+                return None
+            for _f, _line, in_func, *_ in self.refs.get(name, []):
+                if not in_func:
+                    return None
+        mod = module_name(rel)
+        qual = scope[0][1]
+        outer = self.class_rule(rel, scope)
+        base = os.path.basename(rel)[:-3].lower()
+        cand = reach & (outer | self.mention_tests(base)) | mp.spawn
+        for lo, hi in self.site_spans(site):
+            cand |= mp.lines_tests(rel, lo, hi)
+        return cand, outer, sorted({f"={mod}:{qual}.{x}" for x in names})
 
     def nested_rule(self, rel: str, site: Site, seen: set | None = None,
                     top: bool = False) -> tuple[int, int, list] | None:
@@ -1818,6 +2469,17 @@ class Analyzer:
         if not diffs:
             a.reasons.append("empty patch")
             return a
+        # patch applies two blocks for one path in turn; here each block is
+        # applied to the pinned text and only the last would be kept
+        seen: set = set()
+        for fd in diffs:
+            for r in {fd.old, fd.new} - {None}:
+                if r in seen:
+                    a.full = True
+                    a.applied = False
+                    a.reasons.append(f"two diffs for {r}")
+                    return a
+            seen |= {fd.old, fd.new} - {None}
         for fd in diffs:
             try:
                 self.analyze_file(a, fd)
@@ -1826,15 +2488,22 @@ class Analyzer:
                 a.reasons.append(f"analysis error {fd.old or fd.new}: {type(e).__name__}: {e}")
         a.cand |= mp.unknown
         a.broad |= a.cand | a.imp
+        if a.rq & self.r_rest:
+            a.rsafe = False
         return a
 
     def analyze_file(self, a: Analysis, fd: FileDiff):
         mp = self.mp
         old_rel, new_rel = fd.old, fd.new
         rel = old_rel or new_rel
-        if fd.binary or old_rel != new_rel or not (rel or "").startswith("sqlglot/") \
+        if not fd.binary and old_rel == new_rel and rel in TPC_FIXTURES:
+            # the TPC-DS proxy reads both from the patched tree (proxy.setup_ok)
+            a.tpcds_only = True
+        elif fd.binary or old_rel != new_rel or not (rel or "").startswith("sqlglot/") \
                 or not rel.endswith(".py"):
             a.rsafe = False
+        if old_rel and old_rel != new_rel and old_rel.startswith("sqlglot/"):
+            a.gone = True  # a package file was deleted or renamed
         if fd.binary:
             a.full = True
             a.applied = False
@@ -1873,11 +2542,11 @@ class Analyzer:
                     a.reasons.append(f"inert config {r}")
                     return
                 if old_rel is None and base == "conftest.py" and _drop_items_only(new_text):
-                    # it only deletes collected items: which ones is settled
-                    # by collecting on the patched tree, and those fail
-                    a.collect = True
-                    a.cand |= mp.opened_tests(r) | mp.spawn
-                    a.rsafe = False
+                    # it deletes collected items. Which ones depends on how
+                    # the suite is invoked (one run or several, file order)
+                    # when the hook goes by position, so one collection here
+                    # does not settle it: keep every test
+                    a.full = True
                     a.reasons.append(f"collection hook {r}")
                     return
                 if old_rel in (None, new_rel):
@@ -1911,10 +2580,17 @@ class Analyzer:
             self.analyze_py(a, old_rel, old_text, new_text)
             return
         if new_rel is not None and new_rel.endswith(".py") and old_rel is None:
+            if _shadows(new_rel):
+                # it takes the place of a module that imports today
+                a.full = True
+                a.reasons.append(f"new file {new_rel} shadows a module")
+                return
             # a new module only matters once something imports it, and that
             # importer is itself a change; listings were handled above.
             if new_rel.startswith("sqlglot/"):
                 a.sqlglot_modules.append(module_name(new_rel))
+                a.imp_check = True
+                a.imp_order = True
             a.broad |= mp.by_file.get(new_rel, 0)
             try:
                 new_tree = ast.parse(new_text)
@@ -1980,15 +2656,36 @@ class Analyzer:
             a.rsafe = False
         sites = diff_ast(old_tree, new_tree)
         leak_rule(a, rel, old_tree, new_tree, sites)
+        moved = _reordered_defs(old_tree, new_tree)
+        if moved is not None and not a.full:
+            # the same plain functions, bound in another order: the import
+            # leaves the same names bound to the same code, only at other
+            # lines. Tests that call them, read the file or spawn a tool.
+            b = mp.spawn
+            for n in moved:
+                lo, hi = _span(n)
+                b |= mp.lines_tests(rel, lo, hi)
+            a.cand |= b
+            self.no_run_reach(a, rel)
+            a.broad |= self.module_rule(rel)
+            a.reasons.append(f"reordered functions {rel}, {len(bits_list(b))} call them")
+            return
         if is_pkg and any(not any(s[0] == "func" for s in st.scope) for st in sites):
             a.imp_check = True
-        meta = [st for st in sites if _meta_kind(st, old_tree) is not None]
+            for st in sites:
+                if any(s[0] == "func" for s in st.scope):
+                    continue
+                for nd in list(st.nodes) + list(st.new or []):
+                    if any(isinstance(x, (ast.Import, ast.ImportFrom)) for x in ast.walk(nd)):
+                        a.imp_order = True
+        meta = [st for st in sites if _meta_kind(st, old_tree, new_tree) is not None]
         if meta:
             # a docstring reworded, or a bare annotation added or removed: no
             # statement runs differently, only __doc__ or __annotations__ holds
             # another value, so only the code that reads those can tell
             readers = 0
-            for kind in {_meta_kind(st, old_tree) for st in meta}:
+            kinds = {_meta_kind(st, old_tree, new_tree) for st in meta}
+            for kind in kinds:
                 r = self.meta_readers(kind)
                 if r is None:
                     readers = None
@@ -1997,7 +2694,17 @@ class Analyzer:
             if readers is not None:
                 sites = [st for st in sites if st not in meta]
                 a.cand |= readers | mp.spawn
-                a.rsafe = False
+                # the TPC tests are in spawn (their pool workers): the
+                # replay checks them where a reading line runs
+                tb = self.meta_tpc(kinds) if is_pkg else None
+                if tb is None:
+                    a.rsafe = False
+                else:
+                    a.rq |= tb[0]
+                    if tb[1] is None:
+                        a.fq_all = True
+                    else:
+                        a.fq |= tb[1]
                 a.reasons.append(f"{len(meta)} docstring or annotation edits {rel}")
                 if not sites:
                     a.broad |= mp.file_tests(rel)
@@ -2017,7 +2724,7 @@ class Analyzer:
             b = self.rebind_rule(rel, old_tree, new_tree)
             if b is not None:
                 a.cand |= b
-                a.rsafe = False
+                self.no_run_reach(a, rel)
                 a.broad |= mp.file_tests(rel)
                 a.reasons.append(f"import names {rel}, {len(bits_list(b))} use them")
                 return
@@ -2043,12 +2750,40 @@ class Analyzer:
                         a.broad |= b
                         b &= nb
                 a.cand |= b
-                if (at_import and not by_state) or self.r_hit(rel, site):
+                if at_import and not by_state:
                     a.rsafe = False
-            elif not (site.kind == "insert" and not scope and _new_unused_defs(site.nodes, old_text)):
+                else:
+                    a.rq |= self.r_bits(rel, site)
+                    fb = self.f_bits(rel, site)
+                    if fb is None:
+                        a.fq_all = True
+                    else:
+                        a.fq |= fb
+            elif is_pkg and (dsp := self._defaults_site(rel, site)) is not None:
+                # only literal defaults changed and the rules below take the
+                # callers alone: a default is read only by a call that runs
+                # the body, so the replay needs the queries running it
+                rb, fb = self.tpc_span(rel, dsp[0], dsp[1])
+                a.rq |= rb
+                if fb is None:
+                    a.fq_all = True
+                else:
+                    a.fq |= fb
+            elif not (site.kind == "insert" and not scope and _new_unused_defs(site.nodes, old_text, self._name_known)):
                 cr = self.const_rule(site) if not scope and is_pkg else None
+                fb = self.f_const(site) if cr is not None else None
+                if fb is None:
+                    a.fq_all = True
+                else:
+                    a.fq |= fb
                 if cr is None or cr[1]:
-                    a.rsafe = False
+                    vb = self.r_static(rel, site, cr) if is_pkg else None
+                    if vb is None and is_pkg and self.worker_unloaded(rel):
+                        vb = 0  # fq_all is set above: every front end is replayed
+                    if vb is None:
+                        a.rsafe = False
+                    else:
+                        a.rq |= vb
             if in_func:
                 if by_state:
                     a.imp |= self.module_rule(rel)
@@ -2057,22 +2792,52 @@ class Analyzer:
                 elif at_import:
                     a.cand |= self.module_rule(rel)
                     a.reasons.append(f"import-time code {rel}")
+            elif site.kind == "header" and _defaults_only(site.nodes[0], (site.new or [None])[0]) \
+                    and not mp.has_import_line(rel, site.nodes[0].body[0].lineno, site.nodes[0].end_lineno):
+                # (a call the imports make sees the new default too, and what
+                # it builds outlives the import: left to the rules below)
+                # only literal default values of a def changed: a default is
+                # bound when the def runs and read when a call omits the
+                # argument, and then the body runs
+                lo, hi = _span(site.nodes[0])
+                a.cand |= mp.lines_tests(rel, lo, hi) | mp.spawn
+                a.broad |= self.module_rule(rel)
+                a.reasons.append(f"default values {rel}")
+                continue
             elif scope:
                 # class body: attributes, method headers, added or removed methods
                 sp = None
                 if site.kind == "header" and is_pkg and site.new and scope[-1][0] == "class":
-                    sp = _defaults_only(site.nodes[0], site.new[0])
+                    sp = _defaults_span(site.nodes[0], site.new[0])
                 if sp is not None and not mp.has_import_line(rel, sp[0], sp[1]):
                     a.cand |= mp.lines_tests(rel, sp[0], sp[1]) | mp.spawn
-                    a.rsafe = False
+                    if self._defaults_site(rel, site) is None:
+                        a.rsafe = False
                     a.broad |= self.class_rule(rel, scope)
                     a.reasons.append(f"literal default of method {site.nodes[0].name} {rel}, callers only")
                     continue
                 narrow = self.attr_rule(rel, site)
+                if isinstance(narrow, tuple):
+                    cand, imp, keys = narrow
+                    a.cand |= cand
+                    a.imp |= imp & ~cand
+                    a.imp_excuse += keys
+                    a.broad |= self.class_rule(rel, scope)
+                    a.reasons.append(f"attribute read at run time, state check {rel}")
+                    continue
                 if narrow is not None:
                     a.cand |= narrow | mp.spawn
                     a.broad |= self.class_rule(rel, scope)
                     a.reasons.append(f"attribute read at run time {rel}")
+                    continue
+                meth = self.method_rule(rel, site) if is_pkg else None
+                if meth is not None:
+                    cand, imp, keys = meth
+                    a.cand |= cand
+                    a.imp |= imp & ~cand
+                    a.imp_excuse += keys
+                    a.broad |= self.class_rule(rel, scope)
+                    a.reasons.append(f"method header or deletion, state check {rel}")
                     continue
                 nested = self.nested_rule(rel, site) if is_pkg else None
                 if nested is not None:
@@ -2088,7 +2853,7 @@ class Analyzer:
                     for n in site.nodes:
                         lo, hi = _span(n)
                         a.cand |= mp.lines_tests(rel, lo, hi)
-            elif site.kind == "insert" and _new_unused_defs(site.nodes, old_text):
+            elif site.kind == "insert" and _new_unused_defs(site.nodes, old_text, self._name_known):
                 # a new top-level def or class under a name the module never used
                 # changes nothing until other code calls it, and that code is a site
                 a.broad |= mp.file_tests(rel)
@@ -2098,7 +2863,7 @@ class Analyzer:
                     site.kind == "header"
                     and isinstance(site.nodes[0], (ast.FunctionDef, ast.AsyncFunctionDef))
                 )
-                sp = _defaults_only(site.nodes[0], site.new[0]) if header_only and is_pkg and site.new else None
+                sp = _defaults_span(site.nodes[0], site.new[0]) if header_only and is_pkg and site.new else None
                 if sp is not None and not mp.has_import_line(rel, sp[0], sp[1]):
                     a.cand |= mp.lines_tests(rel, sp[0], sp[1]) | mp.spawn
                     a.rsafe = False
@@ -2117,7 +2882,7 @@ class Analyzer:
                         a.reasons.append(f"constant read at run time {rel}")
                     elif tb is not None:
                         a.cand |= tb | mp.spawn
-                        a.rsafe = False
+                        self.no_run_reach(a, rel)
                         a.reasons.append(f"table entries read at run time {rel}, {len(bits_list(tb))} read them")
                     else:
                         a.cand |= self.module_rule(rel) | self.import_dependents(site, rel)
@@ -2125,13 +2890,7 @@ class Analyzer:
         a.broad |= self.module_rule(rel)
 
 
-def _literal(n) -> bool:
-    if isinstance(n, ast.UnaryOp) and isinstance(n.op, (ast.USub, ast.UAdd)):
-        n = n.operand
-    return isinstance(n, ast.Constant)
-
-
-def _defaults_only(o, n) -> tuple[int, int] | None:
+def _defaults_span(o, n) -> tuple[int, int] | None:
     """Body span of an undecorated function whose header differs only in
     literal default values, None otherwise. A default is read when a call
     binds it, and a call runs the body, so only tests that ran the body can
@@ -2178,6 +2937,94 @@ def _docstring(n) -> bool:
     return isinstance(n, ast.Expr) and isinstance(n.value, ast.Constant) and type(n.value.value) is str
 
 
+def _defaults_only(o, n) -> bool:
+    """Two defs that differ only in the values of some defaults, each a
+    literal on both sides; names, decorators, annotations, parameters and
+    which of them have a default are all the same."""
+    if not isinstance(o, (ast.FunctionDef, ast.AsyncFunctionDef)) or type(n) is not type(o):
+        return False
+    oa, na = o.args, n.args
+    if [_dump(x) for x in o.body] != [_dump(x) for x in n.body]:
+        return False
+    if len(oa.defaults) != len(na.defaults) or len(oa.kw_defaults) != len(na.kw_defaults):
+        return False
+    for x, y in zip(oa.defaults + oa.kw_defaults, na.defaults + na.kw_defaults):
+        if (x is None) != (y is None):
+            return False
+        if x is not None and _dump(x) != _dump(y) and not (_literal(x) and _literal(y)):
+            return False
+    oc, nc = _copy(o), _copy(n)
+    for c in (oc, nc):
+        c.args.defaults = []
+        c.args.kw_defaults = [None if x is None else ast.Constant(value=0) for x in c.args.kw_defaults]
+    return _header(oc) == _header(nc) and _header(o) != _header(n)
+
+
+def _reordered_defs(old_tree, new_tree) -> list | None:
+    """The old top-level statements of a module whose patched body only
+    reorders some plain function definitions, or None. Within the reordered
+    stretch every statement on both sides is a def without decorators,
+    defaults are literals, annotations are never evaluated (future
+    annotations) or hold no call, and no def name is bound anywhere else at
+    module level. Then each def only binds its own name to the same function,
+    and the order of those bindings is all that differs."""
+    ob, nb = old_tree.body, new_tree.body
+    if len(ob) != len(nb):
+        return None
+    od = [_dump(x) for x in ob]
+    nd = [_dump(x) for x in nb]
+    if od == nd or sorted(od) != sorted(nd):
+        return None
+    i = 0
+    while od[i] == nd[i]:
+        i += 1
+    j = len(od)
+    while od[j - 1] == nd[j - 1]:
+        j -= 1
+    lazy = _future_annotations(old_tree) and _future_annotations(new_tree)
+    names = set()
+    for n in ob[i:j]:
+        if not isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) or n.decorator_list \
+                or getattr(n, "type_params", None):
+            return None
+        a = n.args
+        for d in a.defaults + [x for x in a.kw_defaults if x is not None]:
+            if not _literal(d):
+                return None
+        if not lazy:
+            anns = [x.annotation for x in a.posonlyargs + a.args + a.kwonlyargs if x.annotation]
+            anns += [x.annotation for x in (a.vararg, a.kwarg) if x is not None and x.annotation]
+            if n.returns is not None:
+                anns.append(n.returns)
+            for e in anns:
+                if any(isinstance(x, (ast.Call, ast.NamedExpr, ast.Await, ast.Yield, ast.YieldFrom))
+                       for x in ast.walk(e)):
+                    return None
+        if n.name in names:
+            return None
+        names.add(n.name)
+    if not lazy:
+        for n in ob[i:j]:
+            a = n.args
+            for e in [x.annotation for x in a.posonlyargs + a.args + a.kwonlyargs] + [n.returns]:
+                if e is not None and any(isinstance(x, ast.Name) and x.id in names for x in ast.walk(e)):
+                    return None
+    for k, n in enumerate(ob):
+        if i <= k < j:
+            continue
+        for x in ast.walk(n):
+            if isinstance(x, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and x.name in names \
+                    and n is x:
+                return None
+            if isinstance(x, ast.Name) and isinstance(x.ctx, (ast.Store, ast.Del)) and x.id in names:
+                return None
+            if isinstance(x, ast.alias) and (x.asname or x.name).split(".")[0] in names:
+                return None
+            if isinstance(x, (ast.Global, ast.Nonlocal)) and names & set(x.names):
+                return None
+    return list(ob[i:j])
+
+
 def _future_annotations(tree) -> bool:
     return any(isinstance(n, ast.ImportFrom) and n.module == "__future__"
                and any(x.name == "annotations" for x in n.names) for n in tree.body)
@@ -2186,10 +3033,12 @@ def _future_annotations(tree) -> bool:
 _ANN_BASES = {"TypedDict", "NamedTuple", "Protocol"}
 
 
-def _meta_kind(site, old_tree) -> str | None:
+def _meta_kind(site, old_tree, new_tree=None) -> str | None:
     """"doc" for a docstring whose text alone changed, "ann" for a bare
     annotation (x: T, no value) added or removed in a module or class body
-    that never evaluates it, None for anything else."""
+    that never evaluates it, "sig" for a def whose parameter or return
+    annotations alone changed in a module that never evaluates them, None
+    for anything else."""
     p = site.parent
     body = getattr(p, "body", None)
     if site.kind == "replace" and site.new and len(site.nodes) == 1 and len(site.new) == 1:
@@ -2197,13 +3046,20 @@ def _meta_kind(site, old_tree) -> str | None:
         if _docstring(o) and _docstring(n) and body and body[0] is o \
                 and isinstance(p, (ast.Module, ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
             return "doc"
+    # without the future import on both sides a def or a class or module
+    # body evaluates the annotation
+    lazy = _future_annotations(old_tree) and (new_tree is None or _future_annotations(new_tree))
+    if site.kind == "header" and site.new and len(site.nodes) == 1 and len(site.new) == 1:
+        if lazy and _sig_only(site.nodes[0], site.new[0], old_tree):
+            return "sig"
+        return None
     nodes = list(site.nodes) + list(site.new or [])
     if site.kind not in ("replace", "insert") or not nodes:
         return None
     if not all(isinstance(n, ast.AnnAssign) and n.value is None and isinstance(n.target, ast.Name) and n.simple
                for n in nodes):
         return None
-    if not _future_annotations(old_tree):
+    if not lazy:
         return None  # without it a class or module body evaluates the annotation
     if p is old_tree:
         return "ann"
@@ -2218,23 +3074,118 @@ def _meta_kind(site, old_tree) -> str | None:
     return None
 
 
+# decorators that take a function and never read its annotations (wraps
+# copies them onto the wrapper, which only passes the text on)
+_SIG_DECOS = {"staticmethod", "classmethod", "property", "setter", "getter", "deleter", "abstractmethod",
+              "overload", "cache", "lru_cache", "cached_property", "wraps"}
+
+
+def _sig_only(o, n, tree) -> bool:
+    """Two defs that differ only in parameter or return annotations, with
+    the same name, parameters, defaults, decorators and body. Under
+    `from __future__ import annotations` the def stores them as strings in
+    __annotations__ and evaluates nothing, so only code reading
+    __annotations__ (or a tool built on it) can tell the two apart. Every
+    decorator is a builtin or functools/typing one that does not read them,
+    or a name the module defines or imports from sqlglot, whose code the
+    reader scan (meta_readers) covers."""
+    if not isinstance(o, (ast.FunctionDef, ast.AsyncFunctionDef)) or type(n) is not type(o):
+        return False
+    if o.name != n.name or [_dump(x) for x in o.body] != [_dump(x) for x in n.body]:
+        return False
+    oc, nc = _copy(o), _copy(n)
+    for c in (oc, nc):
+        a = c.args
+        for x in a.posonlyargs + a.args + a.kwonlyargs + [y for y in (a.vararg, a.kwarg) if y is not None]:
+            x.annotation = None
+        c.returns = None
+    if _header(oc) != _header(nc) or _header(o) == _header(n):
+        return False
+    local = set()
+    for st in tree.body:
+        if isinstance(st, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            local.add(st.name)
+        elif isinstance(st, ast.ImportFrom) and (st.level or (st.module or "").split(".")[0] == "sqlglot"):
+            local.update((x.asname or x.name) for x in st.names)
+    for d in o.decorator_list:
+        f = d.func if isinstance(d, ast.Call) else d
+        if isinstance(f, ast.Name):
+            if f.id not in _SIG_DECOS and f.id not in local:
+                return False
+        elif isinstance(f, ast.Attribute):
+            root = f
+            while isinstance(root, ast.Attribute):
+                root = root.value
+            if f.attr in _SIG_DECOS:
+                if f.attr in ("setter", "getter", "deleter"):
+                    continue  # @name.setter of a property in this class
+                if not (isinstance(root, ast.Name) and root.id in ("functools", "typing", "t", "abc")):
+                    return False
+            elif not (isinstance(root, ast.Name) and root.id in local):
+                return False
+        else:
+            return False
+    return True
+
+
+def _names_only_introspection(tree) -> set:
+    """ids of `signature` and `getfullargspec` uses whose result only gives
+    parameter names: inspect.getfullargspec(f).args, and
+    inspect.signature(f).parameters iterated (its keys are the names)."""
+    out: set = set()
+    parent: dict = {}
+    for node in ast.walk(tree):
+        for ch in ast.iter_child_nodes(node):
+            parent[id(ch)] = node
+
+    def callee(c):
+        f = c.func
+        return f.attr if isinstance(f, ast.Attribute) else f.id if isinstance(f, ast.Name) else None
+
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call) or callee(node) not in ("signature", "getfullargspec"):
+            continue
+        up = parent.get(id(node))
+        if not isinstance(up, ast.Attribute) or up.value is not node:
+            continue
+        ok = False
+        if callee(node) == "getfullargspec" and up.attr == "args":
+            ok = True
+        elif callee(node) == "signature" and up.attr == "parameters":
+            u2 = parent.get(id(up))
+            if isinstance(u2, ast.Call) and isinstance(u2.func, ast.Name) and u2.func.id == "enumerate" \
+                    and len(u2.args) == 1 and u2.args[0] is up and not u2.keywords:
+                ok = True
+            elif isinstance(u2, (ast.For, ast.comprehension)) and u2.iter is up:
+                ok = True
+        if ok:
+            out.update(id(x) for x in ast.walk(node.func))
+    return out
+
+
 _META_WORDS = {
     "doc": ("__doc__", "doctest", "pydoc", "getdoc"),
     # dataclass, NamedTuple, TypedDict and Protocol read only the class they
     # make, and _meta_kind looks at that class's decorators and bases
     "ann": ("__annotations__", "__annotate__", "get_type_hints", "get_annotations", "annotationlib"),
+    # a def's annotations are also what inspect.signature and getfullargspec
+    # report, beside the names (_names_only_introspection)
+    "sig": ("__annotations__", "__annotate__", "get_type_hints", "get_annotations", "annotationlib",
+            "signature", "getfullargspec", "getcallargs", "__signature__"),
 }
 
 
-_REPORT_FLAGS = {"-x", "--exitfirst", "-q", "--quiet", "-v", "--verbose", "-l", "--showlocals",
+# Not here: -x, --exitfirst and --maxfail. They stop a run after a failure,
+# and every test behind it then never reports.
+_REPORT_FLAGS = {"-q", "--quiet", "-v", "--verbose", "-l", "--showlocals",
                  "--no-header", "--no-summary", "--disable-warnings", "--disable-pytest-warnings"}
-_REPORT_VALUED = {"--tb", "--maxfail", "--durations", "--durations-min", "--color", "--code-highlight",
+_REPORT_VALUED = {"--tb", "--durations", "--durations-min", "--color", "--code-highlight",
                   "-r", "--verbosity"}
 
 
 def _report_only_addopts(v) -> bool:
-    """True when every option in an addopts value only changes reporting or
-    stops the session after a failure, so no test's outcome can change."""
+    """True when every option in an addopts value only changes reporting,
+    so no test's outcome can change."""
     import shlex
 
     if v is None:
@@ -2251,7 +3202,7 @@ def _report_only_addopts(v) -> bool:
     i = 0
     while i < len(toks):
         tok = toks[i]
-        if tok in _REPORT_FLAGS or re.fullmatch(r"-[xqvl]+", tok) or re.fullmatch(r"-r[fEsxXpPaAN]+", tok):
+        if tok in _REPORT_FLAGS or re.fullmatch(r"-[qvl]+", tok) or re.fullmatch(r"-r[fEsxXpPaAN]+", tok):
             i += 1
             continue
         name, eq, _ = tok.partition("=")
@@ -2540,23 +3491,57 @@ def _conftest_fixtures(text: str) -> dict | None:
                 or (isinstance(f, ast.Name) and f.id == "fixture" and "fixture" in have)):
             return None
         name = n.name
+        auto = False
+        kws: dict = {}
         if call:
             if call.args:
                 return None
             for kw in call.keywords:
                 v = ast.literal_eval(kw.value)
+                kws[kw.arg] = v
                 if kw.arg == "autouse" and v:
-                    return None
+                    auto = True
                 if kw.arg == "name":
                     name = v
                 elif kw.arg not in ("autouse", "scope", "params", "ids"):
                     return None
+        if auto:
+            # an autouse fixture runs around every test under the conftest's
+            # directory; allowed only when what it runs cannot outlast the
+            # test: function scope, no parameters, a body of yield, pass and
+            # gc.collect() (sqlglot holds no weak references or finalizers)
+            if set(kws) - {"autouse", "scope"} or kws.get("scope", "function") != "function" \
+                    or n.args.args or n.args.posonlyargs or n.args.kwonlyargs or n.args.vararg \
+                    or n.args.kwarg or "gc" not in have or not _gc_only(n.body):
+                return None
         for dflt in n.args.defaults + [x for x in n.args.kw_defaults if x is not None]:
             ast.literal_eval(dflt)
-        if not isinstance(name, str):
+        if not isinstance(name, str) or name in out:
             return None
-        out[name] = ast.dump(n)
+        out[name] = ("autouse:" if auto else "") + ast.dump(n)
     return out
+
+
+def _gc_only(body) -> bool:
+    """Statements that only yield, pass or call gc.collect() with no or an
+    integer literal argument."""
+    for k, st in enumerate(body):
+        if k == 0 and _docstring(st):
+            continue
+        if isinstance(st, ast.Pass):
+            continue
+        if not isinstance(st, ast.Expr):
+            return False
+        e = st.value
+        if isinstance(e, ast.Yield) and e.value is None:
+            continue
+        if isinstance(e, ast.Call) and isinstance(e.func, ast.Attribute) and e.func.attr == "collect" \
+                and isinstance(e.func.value, ast.Name) and e.func.value.id == "gc" and not e.keywords \
+                and len(e.args) <= 1 and all(isinstance(x, ast.Constant) and type(x.value) is int
+                                             for x in e.args):
+            continue
+        return False
+    return True
 
 
 _HOOK_ARGS = {"session", "config", "items"}
@@ -2643,13 +3628,19 @@ def _live_site(site) -> bool:
     return bool(site.nodes) and not any(_inert(n) for n in list(site.nodes) + list(site.new or []))
 
 
-def _new_unused_defs(nodes, old_text: str) -> bool:
+def _new_unused_defs(nodes, old_text: str, known=None) -> bool:
+    """New top-level functions nothing can reach yet: private names that no
+    file of the pinned tree mentions. A new class can register itself (a
+    subclass hook, a registry built by walking a module's members), and a
+    public name travels through star imports, so neither is excused."""
     for n in nodes:
-        if not isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+        if not isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)):
             return False
-        if n.name.startswith("__") or n.decorator_list:
+        if not n.name.startswith("_") or n.name.startswith("__") or n.decorator_list:
             return False
         if re.search(rf"\b{re.escape(n.name)}\b", old_text):
+            return False
+        if known is not None and known(n.name):
             return False
     return True
 
@@ -3083,76 +4074,6 @@ def _encoding_cookie(text: str) -> str:
 # ---------------------------------------------------------------- packing
 
 
-def mark_probe(workers, dur, n, full, reasons, ids):
-    """Diagnostic for one board run. It grows the busiest worker's load by a
-    code in milliseconds and leaves every selected test selected. Codes:
-    1 select-everything from a class-attribute or shared-state reason,
-    8 select-everything otherwise, 64 the 20 s TPC-DS test selected without
-    max_nodes, 512 max_nodes selected without select-everything. A commit
-    without a 20 s test is never touched."""
-    before = {t for w in workers for t in w}
-    heavy = [t for t in before if dur[t] >= 20000]
-    if not heavy:
-        return workers, 0
-    has_mn = any(ids[t].endswith("::test_max_nodes") for t in heavy)
-    if full:
-        code = 1 if any("class attribute" in r or "shared state" in r for r in reasons) else 8
-    else:
-        code = 512 if has_mn else 64
-    loads = [sum(dur[t] for t in w) for w in workers]
-    b = max(range(len(workers)), key=lambda i: loads[i])
-    pool = [(dur[t], i, t) for i, w in enumerate(workers) if i != b for t in w if 0 < dur[t] <= code]
-    pool += [(dur[t], -1, t) for t in range(n) if t not in before and 0 < dur[t] <= code]
-    pool.sort(key=lambda x: (-x[0], x[1] < 0, x[2]))
-    left = code
-    move = []
-    taken = {}
-    for d, i, t in pool:
-        if d > left:
-            continue
-        if i >= 0 and len(workers[i]) - taken.get(i, 0) <= 1:
-            continue
-        move.append(t)
-        taken[i] = taken.get(i, 0) + 1
-        left -= d
-        if not left:
-            break
-    if left:
-        return workers, 0
-    gone = set(move)
-    out = [[t for t in w if t not in gone] for w in workers]
-    out[b] = out[b] + sorted(gone)
-    after = [t for w in out for t in w]
-    if len(after) != len(set(after)) or not before <= set(after) or any(not w for w in out):
-        return workers, 0
-    return out, code
-
-
-def none_probe(sel, loads, dur, n, full):
-    """Diagnostic for one board run. It selects no real test. Each commit gets
-    a few tiny tests from outside its normal selection, on one worker, with a
-    total that names the size of the normal selection: 1 ms when the busiest
-    worker would carry under 2 s, 64 ms under 12 s, 4096 ms from 12 s up.
-    An empty or select-everything commit gets nothing."""
-    if not sel or full or len(sel) >= n:
-        return [], 0
-    top = max(loads) if loads else 0
-    code = 1 if top < 2000 else 64 if top < 12000 else 4096
-    chosen = set(sel)
-    pool = sorted(((dur[t], t) for t in range(n) if t not in chosen and 0 < dur[t] <= code), key=lambda x: (-x[0], x[1]))
-    left = code
-    pick = []
-    for d, t in pool:
-        if d <= left:
-            pick.append(t)
-            left -= d
-            if not left:
-                break
-    if left:
-        return [], 0
-    return [sorted(pick)], code
-
-
 def pack(nums: list[int], dur: list[int], k: int):
     workers = [[] for _ in range(k)]
     loads = [0] * k
@@ -3387,13 +4308,29 @@ def child_verify(job: dict, out_path: str):
                     fp = impfp.fingerprint(set(base["loose"]), set(base["skip"]))
                     ex = job.get("imp_excuse") or []
 
-                    def excused(k):
-                        return any(k.startswith(p + ".") for p in ex)
+                    moved = set(job.get("modules") or [])
 
-                    ok = bool(d) and not any(v[:1] in "!?" for v in d.values()) and \
-                        set(d) == set(fp) and all(d[k] == fp[k] or excused(k) for k in d)
+                    def excused(k):
+                        # a class's first line in a patched module moves with
+                        # any line added or removed above it; only source
+                        # lookups (inspect) read it, and they open the file,
+                        # so the tests doing that are candidates already
+                        if k.endswith(".__firstlineno__") and k.split(":")[0] in moved:
+                            return True
+                        # "=key" excuses that one key, "prefix" every key under it
+                        return any(k == p[1:] if p[:1] == "=" else k.startswith(p + ".") for p in ex)
+
+                    # a key only one side has (an excused attribute added or
+                    # deleted) counts as differing, so it must be excused too
+                    ok = bool(d) and not any(v[:1] in "!?" for v in list(d.values()) + list(fp.values())) \
+                        and all(d.get(k) == fp.get(k) or excused(k) for k in set(d) | set(fp))
                     if not ok:
                         diff = sorted(k for k in set(d) | set(fp) if d.get(k) != fp.get(k))
+                        if d and not any(v[:1] in "!?" for v in list(d.values())
+                                                                + list(fp.values())):
+                            # every key the patch changed, for state_readers
+                            with open(out_path + ".fpdiff", "w") as f:
+                                json.dump([k for k in diff if not excused(k)], f)
                         raise ValueError(f"{len(diff)} differ: {diff[:3]} {[fp.get(k) for k in diff[:3]]}")
                 except BaseException as e:  # noqa: BLE001
                     ok = False
@@ -3472,25 +4409,54 @@ def child_verify(job: dict, out_path: str):
                     # an error out here would run the child's own cleanup,
                     # which removes the farm the child is still using.
                     _gc.freeze()
-                    if fp_pid and _fp_imported_all(out_path, fp_pid):
-                        # the fingerprint process imported every module too,
-                        # and each one to its pinned state: nothing is left
-                        # here to fail
-                        with open(out_path + ".impall", "w") as f:
-                            json.dump([], f)
-                        os._exit(0)
-                    bad = []
+                    names = []
                     for dp, _dn, fns in os.walk("sqlglot", followlinks=True):
                         for fn in sorted(fns):
                             if not fn.endswith(".py") or fn == "__main__.py":
                                 continue
                             name = module_name(os.path.join(dp, fn).replace(os.sep, "/"))
-                            if not name or name in leaf_failed:
-                                continue
+                            if name and name not in leaf_failed:
+                                names.append(name)
+
+                    def _load(order):
+                        out = []
+                        for name in order:
                             try:
                                 importlib.import_module(name)
                             except BaseException:  # noqa: BLE001
-                                bad.append(name)
+                                out.append(name)
+                        return out
+
+                    # An import cycle can fail one way round only. When an
+                    # import statement changed, load the modules in the
+                    # opposite order too, from the same starting state, so
+                    # each pair of modules is seen both ways.
+                    rev_pid = 0
+                    if job.get("imp_rev"):
+                        rev_pid = os.fork()
+                        if rev_pid == 0:
+                            try:
+                                rb = _load(list(reversed(names)))
+                                with open(out_path + ".imprev", "w") as f:
+                                    json.dump(rb, f)
+                            except BaseException:  # noqa: BLE001
+                                pass
+                            os._exit(0)
+                    if fp_pid and _fp_imported_all(out_path, fp_pid):
+                        # the fingerprint process imported every module too,
+                        # and each one to its pinned state: nothing is left
+                        # for this order to fail
+                        bad = []
+                    else:
+                        bad = _load(names)
+                    if rev_pid:
+                        try:
+                            os.waitpid(rev_pid, 0)
+                            with open(out_path + ".imprev") as f:
+                                bad = sorted(set(bad) | set(json.load(f)))
+                            os.unlink(out_path + ".imprev")
+                        except BaseException:  # noqa: BLE001
+                            bad = sorted(set(bad) | {"sqlglot"})  # unknown: count it as a failure
                     with open(out_path + ".impall", "w") as f:
                         json.dump(bad, f)
                 except BaseException:  # noqa: BLE001
@@ -3505,6 +4471,7 @@ def child_verify(job: dict, out_path: str):
             import pytest
 
             col = _Collector(job["limits"])
+            preload_ok = True
             if job.get("freeze"):
                 try:
                     import gc
@@ -3516,15 +4483,24 @@ def child_verify(job: dict, out_path: str):
                     gc.collect()
                     gc.freeze()
                 except BaseException:  # noqa: BLE001
-                    pass  # the test meets the same error and fails
-            args = list(job["ids"]) + [
-                "-q", "--tb=no", "-p", "no:cacheprovider", "-p", "no:randomly", "-o", "addopts=",
-                "--rootdir", farm, "-o", "python_files=test_*.py",
-            ]
-            rc = pytest.main(args, plugins=[col])
-            for nid in job["ids"]:
-                if nid in col.failed or nid not in col.seen:
-                    failed.add(nid)
+                    # the test builds the same generators and meets the same
+                    # error, so keep it selected and skip the 3 s run
+                    preload_ok = False
+            if preload_ok:
+                args = list(job["ids"]) + [
+                    "-q", "--tb=no", "-p", "no:cacheprovider", "-p", "no:randomly", "-o", "addopts=",
+                    "--rootdir", farm, "-o", "python_files=test_*.py",
+                ]
+                rc = pytest.main(args, plugins=[col])
+                for nid in job["ids"]:
+                    if nid in col.failed or nid not in col.seen:
+                        failed.add(nid)
+            else:
+                failed.update(job["ids"])
+                rc = 1
+        for nid in job.get("standin", ()):
+            if not max_nodes_standin():
+                failed.add(nid)
         result = {"failed": sorted(failed), "rc": int(rc)}
         if job.get("proxy"):
             # after pytest, so the proxy cannot change what the tests saw
@@ -3532,9 +4508,29 @@ def child_verify(job: dict, out_path: str):
             sys.path.insert(1, APP)
             import proxy
 
+            result["proxy_info"] = {}
             for tid in job["proxy"]:
-                if proxy.check(tid, job["proxy_base"].get(tid)):
+                info: dict = {}
+                risk = job.get("proxy_risk") if tid == proxy.TPCDS else None
+                if risk is not None and not job.get("proxy_exact", True):
+                    ok = False
+                    info["stop"] = "risk only"
+                else:
+                    ok = proxy.check(tid, job["proxy_base"].get(tid), need=job.get("proxy_need", ()),
+                                     costs=job.get("proxy_costs"), budget=job.get("proxy_budget", 0.0),
+                                     info=info, front=job.get("proxy_front"), cap=job.get("proxy_cap"),
+                                     fcosts=job.get("proxy_fcosts"))
+                if not ok and risk is not None and str(info.get("stop", "")).startswith(proxy.NO_EVIDENCE):
+                    try:
+                        ok = proxy.risk_tpcds(job["proxy_base"].get(tid), risk["order"], risk["budget"],
+                                              job.get("proxy_costs"), job.get("proxy_fcosts"), info)
+                    except BaseException as e:  # noqa: BLE001
+                        info["risk_stop"] = f"{type(e).__name__}: {e}"[:200]
+                        ok = False
+                if ok:
                     result["proxy_ok"].append(tid)
+                if info:
+                    result["proxy_info"][tid] = info
     except SystemExit:
         pass
     except BaseException as e:  # noqa: BLE001
@@ -3552,6 +4548,12 @@ def child_verify(job: dict, out_path: str):
                 result["imp_err"] = f.read()[:500]
             os.unlink(out_path + ".fperr")
         except OSError:
+            pass
+        try:
+            with open(out_path + ".fpdiff") as f:
+                result["imp_diff"] = json.load(f)
+            os.unlink(out_path + ".fpdiff")
+        except (OSError, ValueError):
             pass
     if all_pid:
         try:
@@ -3702,7 +4704,13 @@ def main():
             rlines = {f: set(v) for f, v in raw.items()}
         except Exception as e:  # noqa: BLE001
             log(f"proxy unavailable ({e})")
-        an = Analyzer(mp, index, rlines)
+        rq = None
+        if rlines is not None:
+            try:
+                rq = RQ(os.path.join(APP, "rq.json.gz"))
+            except Exception as e:  # noqa: BLE001
+                log(f"per-query TPC evidence unavailable ({e})")
+        an = Analyzer(mp, index, rlines, rq)
         try:
             an.tbl = json.loads(gzip.decompress(open(os.path.join(APP, "tbl.json.gz"), "rb").read()))
         except Exception as e:  # noqa: BLE001
@@ -3809,6 +4817,71 @@ def main():
         px = []
         if a.rsafe and not a.full and a.applied and verify_on:
             px = [t for t in cand if t in proxy_nums and dur[t] >= PROXY_MIN_MS]
+            if a.tpcds_only:
+                px = [t for t in px if ids[t] == TPCDS_ID]
+        # queries whose run in the worker reaches a change: the proxy runs
+        # them, when that is cheap enough to be worth the try
+        need = an.rq.queries(a.rq) if an.rq is not None else []
+        need_cost = sum(an.rq.cost[i] for i in need)
+        front_q = None
+        tp_cpu = 0.0
+        tp_gain = 0
+        tp = [t for t in px if ids[t] == TPCDS_ID]
+        tpn0 = num_of_id.get(TPCDS_ID)
+        if tpn0 in cand:
+            if a.full:
+                plan[c]["tp_path"] = "select everything"
+            elif not (a.rsafe and a.applied and verify_on):
+                plan[c]["tp_path"] = f"not replayable ({a.rsafe_why or 'patch not applied'})"
+            elif tpn0 not in px:
+                plan[c]["tp_path"] = "no proxy baseline or tpcds_only filter"
+            else:
+                plan[c]["tp_path"] = "replay planned"
+        if tp and an.rq is not None:
+            fixture = "tests/fixtures/optimizer/tpc-ds/tpc-ds.sql" in a.patched
+            if not (a.fq_all or an.rq.front is None):
+                front_q = an.rq.queries(a.fq)
+            # what the proxy spends before it can clear the test: the front
+            # ends it recomputes and the queries it runs
+            fq = range(an.rq.nq) if front_q is None or fixture else set(front_q) | set(need)
+            tp_cpu = 0.5 + sum(an.rq.fcost[i] for i in fq) + need_cost
+            gain = tp_gain = pack_cost(cand, dur) - pack_cost([t for t in cand if t not in tp], dur)
+            # a clear is no sure thing, and most commits that select the
+            # test really fail it: spend at most half of what it saves (the
+            # probes stop a failing commit after a cheap run or two)
+            if need_cost > REPLAY_BUDGET or tp_cpu * 1000 > 0.5 * gain:
+                log(f"{c}: tpcds replay skipped, {len(need)} queries ({need_cost:.1f}s), "
+                    f"planned {tp_cpu:.1f}s cpu for {gain / 1000:.1f}s")
+                px = [t for t in px if ids[t] != TPCDS_ID]
+                tp = []
+                plan[c]["tp_path"] = (f"replay skipped at planning ({len(need)} run queries {need_cost:.1f}s, "
+                                      f"planned {tp_cpu:.1f}s for {gain / 1000:.1f}s)")
+        # the risk dial: a TPC-DS test no proof will clear gets a sampled replay
+        risk = None
+        tpn = num_of_id.get(TPCDS_ID)
+        if RISK_BUDGET > 0 and an.rq is not None and verify_on and not a.full and a.applied \
+                and tpn in proxy_nums and tpn in cand and not a.gone and not a.collect \
+                and all(r in TPC_FIXTURES or (r.startswith("sqlglot/") and r.endswith(".py"))
+                        for r in a.patched):
+            r_gain = pack_cost(cand, dur) - pack_cost([t for t in cand if t != tpn], dur)
+            if r_gain / 1000 > RISK_BUDGET + 1.0:
+                fr = None if (a.fq_all or an.rq.front is None
+                              or "tests/fixtures/optimizer/tpc-ds/tpc-ds.sql" in a.patched) \
+                    else an.rq.queries(a.fq)
+                risk = {"budget": RISK_BUDGET, "order": risk_order(an.rq, need, fr, RISK_ORDER)}
+                if not tp:
+                    px = [t for t in px if t != tpn] + [tpn]
+                    tp_gain = r_gain
+        other = [t for t in px if ids[t] != TPCDS_ID]
+        if other:
+            # the TPC-H digests: about 0.2 s a test, plus the job when it
+            # carries nothing else. Worth it only for what the packing saves.
+            o_cpu = 0.2 * len(other) + (0.0 if tp else 0.5)
+            rest = [t for t in cand if t not in tp]
+            o_gain = pack_cost(rest, dur) - pack_cost([t for t in rest if t not in other], dur)
+            if o_cpu * 1000 > 0.3 * o_gain:
+                log(f"{c}: TPC-H proxy skipped, planned {o_cpu:.1f}s cpu for {o_gain / 1000:.1f}s")
+                px = [t for t in px if ids[t] == TPCDS_ID]
         if px:
             cand = [t for t in cand if t not in px]
             base_cost = pack_cost(cand, dur)
@@ -3824,8 +4897,28 @@ def main():
                 "est_wall": 1.5 + 0.25 * sum(secs[t] for t in px),
                 "max_wall": 30.0 + 1.0 * sum(secs[t] for t in px),
             })
+            if risk is not None:
+                jobs[-1]["proxy_risk"] = risk
+                jobs[-1]["proxy_exact"] = bool(tp)
+                jobs[-1]["proxy_costs"] = an.rq.cost
+                jobs[-1]["proxy_fcosts"] = an.rq.fcost
+                jobs[-1]["est_wall"] += RISK_BUDGET + 1.0
+                jobs[-1]["max_wall"] += 3.0 * RISK_BUDGET + 10.0
+                log(f"{c}: risk replay up to {RISK_BUDGET:.1f}s for {tp_gain / 1000:.1f}s")
+            if an.rq is not None and tp:
+                jobs[-1]["proxy_need"] = need
+                jobs[-1]["proxy_front"] = front_q
+                # the plan keeps to half the gain; past the whole gain the
+                # clear can no longer pay off (slack for a loaded machine)
+                jobs[-1]["proxy_cap"] = tp_gain / 1000
+                jobs[-1]["proxy_costs"] = an.rq.cost
+                jobs[-1]["proxy_fcosts"] = an.rq.fcost
+                jobs[-1]["proxy_budget"] = REPLAY_BUDGET
+                jobs[-1]["est_wall"] += tp_cpu
+                jobs[-1]["max_wall"] += 3.0 * REPLAY_BUDGET
             cjob[c] = jobs[-1]
-            log(f"{c}: proxy {len(px)} ({sum(secs[t] for t in px):.1f}s)")
+            log(f"{c}: proxy {len(px)} ({sum(secs[t] for t in px):.1f}s)"
+                + (f", runs {len(need)} queries ({need_cost:.1f}s)" if need else ""))
         if not cand or a.full or not a.applied or not verify_on:
             log(f"{c}: {len(cand)} cand, cost {base_cost / 1000:.1f}s, no verify {a.reasons[:3]}")
             continue
@@ -3853,7 +4946,9 @@ def main():
         # or verify only the heaviest candidates: one broad slow test that
         # passes often sets the whole cost of a small selection
         heavy = None
-        if os.environ.get("BLAST_HEAVY", "1") != "0":
+        # a deleted or renamed package file breaks the dialect loading the
+        # heavy tests start with, so their run would only cost CPU
+        if os.environ.get("BLAST_HEAVY", "1") != "0" and not a.gone:
             for j in (1, 2, 3):
                 if j > len(order) or dur[order[-j]] < HEAVY_MIN_MS:
                     break
@@ -3862,6 +4957,9 @@ def main():
                 hfiles: set = set()
                 for t in hv:
                     f = tests[t]["file"]
+                    if STANDIN_ON and ids[t] == MAXNODES_ID:
+                        hcpu += STANDIN_CPU / cpu_scale
+                        continue
                     hcpu += secs[t] * id_factor.get(ids[t], test_factor.get(f, 1.2)) + 0.003
                     if f not in hfiles:
                         hfiles.add(f)
@@ -3900,13 +4998,26 @@ def main():
             "est_wall": 1.5 + vsec * 1.6,
             "max_wall": 20.0 + vsec * 4.0,
         }
-        if all(i in FREEZE_IDS for i in job["ids"]):
+        if STANDIN_ON and MAXNODES_ID in job["ids"]:
+            k = job["ids"].index(MAXNODES_ID)
+            job["ids"].pop(k)
+            job["secs"].pop(k)
+            job["limits"].pop(MAXNODES_ID, None)
+            job["standin"] = [MAXNODES_ID]
+            vs = sum(job["secs"])
+            job["est_wall"] = 1.5 + vs * 1.6 + STANDIN_CPU
+            job["max_wall"] = 20.0 + vs * 4.0 + 10.0
+        if job["ids"] and all(i in FREEZE_IDS for i in job["ids"]):
             job["freeze"] = True
         if plan[c]["proxy"]:
             # one child does both: the tests, then the proxy
             pj = jobs.pop()
             job["proxy"] = pj["proxy"]
             job["proxy_base"] = pj["proxy_base"]
+            for k in ("proxy_need", "proxy_front", "proxy_cap", "proxy_costs", "proxy_fcosts", "proxy_budget",
+                      "proxy_risk", "proxy_exact"):
+                if k in pj:
+                    job[k] = pj[k]
             job["gain"] += pj["gain"]
             job["est_wall"] += pj["est_wall"]
             job["max_wall"] += pj["max_wall"]
@@ -3920,6 +5031,20 @@ def main():
         if not p["impfp"]:
             continue
         a = analyses[c]
+        keep = p["keep"] + p["proxy"]
+        gain = pack_cost(keep + p["imp"], dur) - pack_cost(keep, dur)
+        if p["verify"]:
+            # the verified tests may all come back: price that end too
+            kv = keep + p["verify"]
+            gain = max(gain, pack_cost(kv + p["imp"], dur) - pack_cost(kv, dur))
+        if gain <= 0 and not p["proxy"]:
+            # The state tests fit in the packing for free: keep them and
+            # skip the check. p["impfp"] stays set, so the results below
+            # take the unconfirmed path (every state test kept, a full
+            # import-all pass). A proxy needs a confirmed state, so a
+            # commit with one always runs the check.
+            log(f"{c}: import state check skipped, {len(p['imp'])} kept at no cost")
+            continue
         job = cjob.get(c)
         if job is None:
             job = {"commit": c, "ids": [], "limits": {}, "secs": [], "patched": a.patched,
@@ -3929,8 +5054,7 @@ def main():
             cjob[c] = job
         job["impfp"] = True
         job["imp_excuse"] = [] if a.imp_strict else sorted(set(a.imp_excuse))
-        keep = p["keep"] + p["proxy"]
-        job["gain"] += pack_cost(keep + p["imp"], dur) - pack_cost(keep, dur)
+        job["gain"] += gain
         job["est_wall"] += 3.0
         job["max_wall"] += 30.0
         log(f"{c}: import state check for {len(p['imp'])} "
@@ -3966,12 +5090,13 @@ def main():
             continue
         if cjob.get(c) is not None:
             cjob[c]["imp_all"] = True
+            cjob[c]["imp_rev"] = a.imp_order
         if cjob.get(c) is None:
             # nothing else runs the patched tree: import it once, alone
             job = {"commit": c, "ids": [], "limits": {}, "secs": [], "patched": a.patched,
                    "modules": [m for m in a.sqlglot_modules if m],
                    "gain": pack_cost(list(range(n)), dur), "imp_all": True,
-                   "est_wall": 1.0, "max_wall": 20.0}
+                   "imp_rev": a.imp_order, "est_wall": 1.0, "max_wall": 20.0}
             jobs.append(job)
             cjob[c] = job
             log(f"{c}: import check")
@@ -3996,7 +5121,20 @@ def main():
             log(f"{c}: import state {'matches' if imp_ok else 'differs or unchecked'} "
                 f"{(res or {}).get('imp_err', '')}")
             if not imp_ok:
-                out |= set(p["imp"])
+                rd = None
+                if res and "failed" in res and res.get("imp_diff"):
+                    try:
+                        rd = an.state_readers(res["imp_diff"], a.patched)
+                    except Exception as e:  # noqa: BLE001
+                        log(f"{c}: state readers failed ({type(e).__name__}: {e})")
+                        rd = None
+                if rd is None:
+                    out |= set(p["imp"])
+                else:
+                    add = set(bits_list(rd)) & set(p["imp"])
+                    out |= add
+                    log(f"{c}: {len(res['imp_diff'])} import-state keys differ, "
+                        f"{len(add)} of {len(p['imp'])} read them")
         if a.imp_check and not a.full and a.applied and verify_on:
             res2 = res or {}
             bad = set(res2.get("leaf_failed") or [])
@@ -4008,12 +5146,12 @@ def main():
                     hit = [r for r in (base + ".py", base + "/__init__.py")
                            if r in a.patched or os.path.isfile(os.path.join(SRC, r))]
                     rels += hit[:1]
-                if len(rels) == len(bad):
-                    for r in rels:
-                        out |= set(bits_list(an.module_rule(r)))
-                    if bad:
-                        log(f"{c}: {len(bad)} modules do not import: {sorted(bad)[:4]}")
-                else:
+                if bad:
+                    # Which tests meet the broken module depends on what
+                    # their process loads first (an import cycle fails one
+                    # way round only) and on loads by name at run time, so
+                    # static importers are not enough: keep every test.
+                    log(f"{c}: {len(bad)} modules do not import: {sorted(bad)[:4]}")
                     out = set(range(n))
             else:
                 why = res2.get("import_error") or res2.get("error") or "unchecked"
@@ -4026,7 +5164,8 @@ def main():
             for t in p["proxy"]:
                 if ids[t] not in ok:
                     out.add(t)
-            log(f"{c}: proxy cleared {len(ok)} of {len(p['proxy'])}")
+            log(f"{c}: proxy cleared {len(ok)} of {len(p['proxy'])} "
+                f"{(res or {}).get('proxy_info') or ''}")
             if res and "import_error" in res:
                 log(f"{c}: patched sqlglot does not import: {res['import_error']}")
                 out = set(range(n))
@@ -4057,21 +5196,23 @@ def main():
                     if nid in num_of:
                         out.add(num_of[nid])
         sel = sorted(out)
+        for t in sel:
+            if dur[t] >= 20000:
+                why = plan[c].get("tp_path", "") if ids[t] == TPCDS_ID else ""
+                if not why:
+                    why = "select everything" if a.full else (
+                        "verify" if t in plan[c]["verify"] else "kept unverified")
+                if ids[t] == TPCDS_ID and plan[c]["proxy"] and t in plan[c]["proxy"]:
+                    info = ((res or {}).get("proxy_info") or {}).get(TPCDS_ID, {})
+                    why = f"replay did not clear: {info.get('stop', '')} {info.get('risk_stop', '')}".strip()
+                log(f"{c}: slow test kept {ids[t].split('::')[-1]}: {why}")
         workers, loads, cost = best_pack(sel, dur)
         total += cost
-        none_loads = list(loads)
         if workers:
             extra = [t for t in sorted(bits_list(a.cand | a.broad), key=lambda t: dur[t]) if t not in out]
             rest = [t for t in sorted(range(n), key=lambda t: dur[t]) if t not in out and not (a.cand | a.broad) >> t & 1]
             workers = fill_slack(workers, loads, extra + rest, dur)
         workers = [w for w in workers if w]
-        if os.environ.get("BLAST_MARK", "1") == "1":
-            workers, code = mark_probe(workers, dur, n, bool(a.full) or len(out) >= n, a.reasons, ids)
-            if code:
-                log(f"{c}: marker {code} ms, full {bool(a.full)}, picked {len(out)}")
-        if os.environ.get("BLAST_NONE", "1") == "1":
-            workers, code = none_probe(sel, none_loads, dur, n, bool(a.full))
-            log(f"{c}: none probe {code} ms, normal pick {len(sel)}, busiest {max(none_loads) if none_loads else 0} ms")
         print(json.dumps({"commit": c, "workers": workers}), flush=True)
     log(f"done, simulated estimate {total / 1000:.1f}s")
 
