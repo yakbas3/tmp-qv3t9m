@@ -13,26 +13,14 @@ and the digest on the patched tree equals the digest on the pinned tree,
 the rest of the test sees identical inputs and runs identical code, so the
 test passes as it does on the pinned tree.
 
-test_execute_tpcds is replayed one fixture query at a time (Replay). Each
-query has a digest of what the test process computes (parse_one, transpile),
-one of what the worker computes before it runs the plan (the pickled
-expression, ensure_schema, optimize, Plan), and one of the result table.
-tools/rq_plugin.py and tools/rq_profile.py record which lines and classes
-each query's run of the plan reaches. A query whose front digests match and
-whose run reaches no change returns the pinned table. Any other query is run
-here on the real tables and its table compared with the pinned one.
-
   python proxy.py --baseline OUT.json   (build time, pinned tree)
 """
 
 from __future__ import annotations
 
-import ast
-import csv
 import enum
 import hashlib
 import json
-import os
 import pickle
 import sys
 import types
@@ -42,9 +30,6 @@ TESTS = {
     "tests/test_executor.py::TestExecutor::test_execute_tpch": ("tpc-h", True, False),
     "tests/test_executor.py::TestExecutor::test_optimized_tpch": ("tpc-h", False, True),
 }
-
-
-TPCDS = "tests/test_executor.py::TestExecutor::test_execute_tpcds"
 
 
 class Opaque(Exception):
@@ -230,13 +215,6 @@ def _guard(h, fn, *args, **kwargs):
         return None
 
 
-def _send(h, expr, meta):
-    """The pool's round trip of one call's arguments (the test submits
-    every fixture query); what raises is written into h."""
-    blob = _guard(h, pickle.dumps, (expr, meta))
-    return None if blob is None else _guard(h, pickle.loads, blob)
-
-
 def digests(test_id: str):
     """Yield one digest per fixture query, in order."""
     from sqlglot import parse_one, transpile
@@ -260,233 +238,16 @@ def digests(test_id: str):
             continue
         expr = _guard(h, parse_one, sql)
         canon(expr, h, memo)
-        # every query goes to a worker, executed or not: a pickle that raises
-        # either way fails the test
-        sent = _send(h, expr, meta)
         if meta.get("execute") and expr is not None:
             canon(_guard(h, transpile, sql, write="duckdb"), h, memo)
-            # the worker runs execute(): optimize, the debug SQL, then Plan
-            canon(sent, h, memo)
+            # the worker gets a pickled copy and runs execute(): optimize, then Plan
+            sent = pickle.loads(pickle.dumps(expr))
             schema = ensure_schema(schema_src, dialect=None)
-            opt = None if sent is None else \
-                _guard(h, optimize, sent[0], schema, leave_tables_isolated=True, dialect=None)
-            if opt is not None:
-                _guard(h, opt.sql, pretty=True)
+            opt = _guard(h, optimize, sent, schema, leave_tables_isolated=True, dialect=None)
             plan = None if opt is None else _guard(h, Plan, opt)
             # after Plan, so whatever Plan did to the tree is in the digest too
             canon((opt, plan), h, memo)
         yield h.hexdigest()
-
-
-def _open_file(file_name):
-    with open(file_name, "rb") as f:
-        gzipped = f.read(2) == b"\x1f\x8b"
-    if gzipped:
-        import gzip
-
-        return gzip.open(file_name, "rt", newline="")
-    return open(file_name, encoding="utf-8", newline="")
-
-
-def load_table(directory: str, table: str, columns):
-    """One fixture table, read as TestExecutor.setUpClass reads it."""
-    from sqlglot.executor.table import Table
-
-    reader = csv.reader(_open_file(f"{directory}{table}.csv.gz"), delimiter="|")
-    rows = []
-    ctypes: list = []
-    next(reader)
-    for row in reader:
-        if not ctypes:
-            for i, v in enumerate(row):
-                try:
-                    ctypes.append(type(ast.literal_eval(v)))
-                except (ValueError, SyntaxError):
-                    ctypes.append(str)
-        rows.append(tuple(None if (t is not str and v == "") else t(v) for t, v in zip(ctypes, row)))
-    return Table(columns=columns, rows=rows)
-
-
-def table_digest(table) -> str:
-    """What the test reads of a result table: the columns and every cell."""
-    h = hashlib.sha256()
-
-    def enc(v):
-        t = type(v)
-        return f"{t.__module__}.{t.__qualname__}:{v!r}"
-
-    h.update((type(table.columns).__qualname__ + "\x1e" + "\x1f".join(enc(c) for c in table.columns)
-              + "\n" + type(table.rows).__qualname__ + "\n").encode("utf-8", "surrogatepass"))
-    for r in table.rows:
-        h.update((type(r).__qualname__ + "\x1e" + "\x1f".join(enc(v) for v in r) + "\n")
-                 .encode("utf-8", "surrogatepass"))
-    return h.hexdigest()
-
-
-class Replay:
-    """test_execute_tpcds, one fixture query at a time."""
-
-    def __init__(self):
-        from tests.helpers import FIXTURES_DIR, TPCDS_SCHEMA, load_sql_fixture_pairs
-
-        self.pairs = list(load_sql_fixture_pairs("optimizer/tpc-ds/tpc-ds.sql"))
-        self.dir = FIXTURES_DIR + "/optimizer/tpc-ds/"
-        self.schema_main = TPCDS_SCHEMA
-        # the workers get pickled copies of the schema and of the tables
-        self.schema = pickle.loads(pickle.dumps(TPCDS_SCHEMA))
-        self.tables: dict = {}
-        self.marks: dict = {}
-        self.memo = Memo()
-
-    def front(self, i: int):
-        """(main digest, worker digest, pickled call) of query i; the last
-        two are None for a query the test does not execute."""
-        from sqlglot import parse_one, transpile
-        from sqlglot.executor import ensure_schema
-        from sqlglot.optimizer import optimize
-        from sqlglot.planner import Plan
-
-        memo = self.memo
-        # the test never reads a pair's optimized SQL
-        meta, sql, _optimized = self.pairs[i]
-        h = hashlib.sha256()
-        h.update(repr((meta, sql)).encode("utf-8", "surrogatepass"))
-        expr = _guard(h, parse_one, sql)
-        canon(expr, h, memo)
-        if not meta.get("execute") or expr is None:
-            # still submitted to a worker, which drops it unread: only a
-            # pickle round trip that raises can matter
-            _send(h, expr, meta)
-            return h.hexdigest(), None, None
-        canon(_guard(h, transpile, sql, write="duckdb"), h, memo)
-        main = h.hexdigest()
-        h = hashlib.sha256()
-        blob = _guard(h, pickle.dumps, (expr, meta))
-        sent = None if blob is None else _guard(h, pickle.loads, blob)
-        canon(sent, h, memo)
-        if sent is None:
-            return main, h.hexdigest(), None
-        # execute() in the worker: ensure_schema, optimize, the debug SQL, Plan
-        schema = _guard(h, ensure_schema, self.schema, dialect=None)
-        canon(schema, h, memo)
-        opt = _guard(h, optimize, sent[0], schema, leave_tables_isolated=True, dialect=None)
-        if opt is not None:
-            # logged at debug level and dropped: only a raise, or what it
-            # does to the tree, can matter
-            _guard(h, opt.sql, pretty=True)
-        plan = None if opt is None else _guard(h, Plan, opt)
-        # after Plan, so whatever Plan did to the tree is in the digest too
-        canon((opt, plan), h, memo)
-        return main, h.hexdigest(), blob
-
-    def table(self, name: str):
-        t = self.tables.get(name)
-        if t is None:
-            t = pickle.loads(pickle.dumps(load_table(self.dir, name, self.schema_main[name])))
-            self.tables[name] = t
-            self.marks[name] = self._mark(t)
-        return t
-
-    @staticmethod
-    def _mark(t):
-        # rows are tuples of plain values: the same row objects in the same
-        # order are the same table
-        return (tuple(t.columns), len(t.rows), hash(tuple(map(id, t.rows))))
-
-    def intact(self) -> bool:
-        """The worker keeps one copy of the schema and of each table for
-        every query it serves: a run that changed one changed the input of
-        the queries after it."""
-        return self.schema == self.schema_main and \
-            all(self._mark(t) == self.marks[name] for name, t in self.tables.items())
-
-    def back(self, blob) -> str:
-        """Run the pickled call as the worker does; digest of the table sent back."""
-        from sqlglot import find_tables
-        from sqlglot.executor import execute
-
-        expression, _meta = pickle.loads(blob)
-        tables = {}
-        for t in find_tables(expression):
-            name = t.name
-            tables[name] = self.table(name)
-        result = execute(expression, schema=self.schema, tables=tables)
-        return table_digest(pickle.loads(pickle.dumps(result)))
-
-
-def setup_ok() -> bool:
-    """TestExecutor.setUpClass reads the TPC-H fixture pairs too, and the
-    class shares one result cache keyed by SQL text. The TPC-DS test sees
-    them only through a raise there or through a TPC-H query equal to one
-    of its own."""
-    from tests.helpers import load_sql_fixture_pairs
-
-    try:
-        h = {sql for _m, sql, _o in load_sql_fixture_pairs("optimizer/tpc-h/tpc-h.sql")}
-        ds = {sql for _m, sql, _o in load_sql_fixture_pairs("optimizer/tpc-ds/tpc-ds.sql")}
-    except Exception:  # noqa: BLE001
-        return False
-    return not (h & ds)
-
-
-def baseline_tpcds() -> list:
-    rp = Replay()
-    out = []
-    for i in range(len(rp.pairs)):
-        main, worker, blob = rp.front(i)
-        out.append([main, worker, None if blob is None else rp.back(blob)])
-        if not rp.intact():
-            raise ValueError(f"query {i} changes the shared tables")
-    return out
-
-
-def check_tpcds(base: list, need=(), costs=None, budget: float = 0.0, info: dict | None = None) -> bool:
-    """True when the test passes as on the pinned tree: every front digest
-    the test process computes matches, and each query whose worker digest
-    differs, or that `need` names, returns the pinned table when run here.
-    Runs cost `costs[i]` each and stop once they exceed `budget`."""
-    info = {} if info is None else info
-    if not setup_ok():
-        info["stop"] = "setup"
-        return False
-    rp = Replay()
-    if len(base) != len(rp.pairs):
-        return False
-    need = set(need)
-    spent = 0.0
-    info["ran"] = []
-    # every front digest first: a mismatch or an overrun budget then costs
-    # no query run
-    runs = []
-    for i in range(len(rp.pairs)):
-        main, worker, blob = rp.front(i)
-        b_main, b_worker, b_table = base[i]
-        if main != b_main:
-            info["stop"] = f"main {i}"
-            return False
-        if b_worker is None:
-            if worker is not None:
-                return False
-            continue
-        if worker == b_worker and i not in need:
-            continue
-        if blob is None or b_table is None:
-            info["stop"] = f"worker {i}"
-            return False
-        spent += float(costs[i]) if costs else float("inf")
-        if spent > budget:
-            info["stop"] = f"budget {i}"
-            return False
-        runs.append((i, blob, b_table))
-    for i, blob, b_table in runs:
-        info["ran"].append(i)
-        if rp.back(blob) != b_table:
-            info["stop"] = f"table {i}"
-            return False
-        if not rp.intact():
-            info["stop"] = f"shared tables {i}"
-            return False
-    return True
 
 
 def baseline() -> dict:
@@ -494,27 +255,19 @@ def baseline() -> dict:
     out = {}
     for tid in TESTS:
         try:
-            out[tid] = baseline_tpcds() if tid == TPCDS else list(digests(tid))
+            out[tid] = list(digests(tid))
         except BaseException as e:  # noqa: BLE001
             print(f"proxy baseline {tid}: {type(e).__name__}: {e}", file=sys.stderr)
             out[tid] = []  # never matches, so the test is always kept
     return out
 
 
-def check(test_id: str, base: list, need=(), costs=None, budget: float = 0.0,
-          info: dict | None = None) -> bool:
+def check(test_id: str, base: list) -> bool:
     """True when every query digest on this tree matches the pinned one.
     Stops at the first difference."""
     sys.setrecursionlimit(max(sys.getrecursionlimit(), 20000))
     if not base or test_id not in TESTS:
         return False
-    if test_id == TPCDS:
-        try:
-            return check_tpcds(base, need, costs, budget, info)
-        except BaseException as e:  # noqa: BLE001
-            if info is not None:
-                info["stop"] = f"{type(e).__name__}: {e}"[:200]
-            return False
     try:
         n = 0
         for i, d in enumerate(digests(test_id)):
