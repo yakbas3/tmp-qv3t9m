@@ -31,5 +31,4 @@ RUN python /app/selector.py --build-index \
 ENV SKIP_INTEGRATION=0 PYTHONUNBUFFERED=1
 # A script given as .py is compiled on every start (0.05 s of CPU); its
 # bytecode runs the same, with /app as sys.path[0] all the same.
-ENV BLAST_MARK=1
 CMD ["python", "/app/main.pyc"]
