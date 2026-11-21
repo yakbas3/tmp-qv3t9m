@@ -813,6 +813,19 @@ def _span(node) -> tuple[int, int]:
 # ---------------------------------------------------------------- analysis
 
 
+def _has_line_event(n) -> bool:
+    """Whether running statement n is seen by the line recorder."""
+    if n is None:
+        return False
+    if isinstance(n, ast.Expr) and isinstance(n.value, ast.Constant):
+        return False
+    if isinstance(n, (ast.Global, ast.Nonlocal)):
+        return False
+    if isinstance(n, ast.AnnAssign) and n.value is None:
+        return False
+    return True
+
+
 class Analysis:
     def __init__(self, commit: str):
         self.commit = commit
@@ -832,6 +845,24 @@ class Analysis:
         self.equiv = ([], {})  # see site_equiv; None once any change is not of that kind
         self.equiv_files: set = set()
         self.collect = False  # a new conftest only drops collected items: collect to see which
+        # a package module changed outside function bodies: its import runs
+        # the change, and a module that no longer imports fails every test
+        self.imp_check = False
+
+
+def leak_rule(a: Analysis, rel: str, old_tree, new_tree, sites):
+    """Shared-process state (leak.py): a test that fails only after an
+    earlier test in its process left state behind is in the labels, but
+    neither the map nor a lone verification run can see it. Select all."""
+    try:
+        import leak
+
+        why = leak.shared_state(rel, old_tree, new_tree, sites)
+    except Exception as e:  # noqa: BLE001
+        why = f"rule error {e}"
+    if why:
+        a.full = True
+        a.reasons.append(f"shared state {rel}: {why}")
 
 
 class Analyzer:
@@ -1315,10 +1346,19 @@ class Analyzer:
     def site_spans(self, site: Site) -> list:
         spans = []
         if site.kind == "insert":
-            if site.prev is not None:
-                spans.append(_span(site.prev))
-            elif site.next is not None:
-                spans.append(_span(site.next))
+            # a neighbour that raises no line event (a docstring, a bare
+            # constant, global/nonlocal, an annotation without a value) is
+            # credited to no test: it cannot stand in for the new statement
+            prev = site.prev if _has_line_event(site.prev) else None
+            nxt = site.next if _has_line_event(site.next) else None
+            if prev is not None:
+                spans.append(_span(prev))
+            elif nxt is not None:
+                spans.append(_span(nxt))
+            elif site.prev is not None or site.next is not None:
+                p = site.parent
+                if p is not None and hasattr(p, "lineno"):
+                    spans.append(_span(p))
             p = site.parent
             if p is not None and hasattr(p, "lineno") and not isinstance(p, SCOPED + (ast.Lambda,)):
                 # the header of an if/for/while/with/try reaching this block;
@@ -1329,6 +1369,16 @@ class Analyzer:
         else:
             for n in site.nodes:
                 spans.append(_span(n))
+            if site.nodes and not any(_has_line_event(n) for n in site.nodes):
+                # only statements without line events were replaced or removed
+                # (a docstring turned into code): credit the block they sit in
+                p = site.parent
+                body = [x for x in getattr(p, "body", []) or []
+                        if _has_line_event(x) and x not in site.nodes]
+                if body:
+                    spans.append(_span(body[0]))
+                elif p is not None and hasattr(p, "lineno"):
+                    spans.append(_span(p))
         return spans
 
     def r_hit(self, rel: str, site: Site) -> bool:
@@ -1811,6 +1861,13 @@ class Analyzer:
             if new_rel.startswith("sqlglot/"):
                 a.sqlglot_modules.append(module_name(new_rel))
             a.broad |= mp.by_file.get(new_rel, 0)
+            try:
+                new_tree = ast.parse(new_text)
+            except SyntaxError:
+                new_tree = None
+            if new_tree is not None:
+                empty = ast.parse("")
+                leak_rule(a, new_rel, empty, new_tree, diff_ast(empty, new_tree))
             return
         if old_rel is not None and new_rel is not None and old_rel != new_rel:
             for r in (old_rel, new_rel):
@@ -1867,6 +1924,9 @@ class Analyzer:
             a.cand |= self.module_rule(rel)
             a.rsafe = False
         sites = diff_ast(old_tree, new_tree)
+        leak_rule(a, rel, old_tree, new_tree, sites)
+        if is_pkg and any(not any(s[0] == "func" for s in st.scope) for st in sites):
+            a.imp_check = True
         meta = [st for st in sites if _meta_kind(st, old_tree) is not None]
         if meta:
             # a docstring reworded, or a bare annotation added or removed: no
@@ -3069,6 +3129,7 @@ def child_verify(job: dict, out_path: str):
     result: dict = {}
     farm = job["farm"]
     fp_pid = 0
+    all_pid = 0
     col_result = None
     try:
         devnull = os.open(os.devnull, os.O_WRONLY)
@@ -3149,12 +3210,44 @@ def child_verify(job: dict, out_path: str):
         cfp.ProcessPoolExecutor = _SyncPool
         import importlib
 
+        leaf_failed = []
         for mod in ["sqlglot"] + job["modules"]:
             try:
                 importlib.import_module(mod)
             except BaseException as e:  # noqa: BLE001
-                result = {"import_error": f"{mod}: {type(e).__name__}: {e}"}
-                raise SystemExit
+                if not leaf_failed:
+                    result = {"import_error": f"{mod}: {type(e).__name__}: {e}"}
+                if mod == "sqlglot":
+                    raise SystemExit
+                # the package still imports: only what loads this module breaks
+                leaf_failed.append(mod)
+        if job.get("imp_all"):
+            # a change the import runs can also break another module's import
+            # (a dialect that parses SQL in its class body): import every
+            # package module, in a process of its own
+            all_pid = os.fork()
+            if all_pid == 0:
+                try:
+                    bad = []
+                    for dp, _dn, fns in os.walk("sqlglot", followlinks=True):
+                        for fn in sorted(fns):
+                            if not fn.endswith(".py") or fn == "__main__.py":
+                                continue
+                            name = module_name(os.path.join(dp, fn).replace(os.sep, "/"))
+                            if not name or name in leaf_failed:
+                                continue
+                            try:
+                                importlib.import_module(name)
+                            except BaseException:  # noqa: BLE001
+                                bad.append(name)
+                    with open(out_path + ".impall", "w") as f:
+                        json.dump(bad, f)
+                except BaseException:  # noqa: BLE001
+                    pass
+                os._exit(0)
+        if leaf_failed:
+            result["leaf_failed"] = leaf_failed
+            raise SystemExit
         failed = set()
         rc = 0
         if job["ids"]:
@@ -3185,6 +3278,14 @@ def child_verify(job: dict, out_path: str):
         result = {"error": f"{type(e).__name__}: {e}"}
     if col_result is not None and "failed" in result:
         result["collected"] = col_result
+    if all_pid:
+        try:
+            os.waitpid(all_pid, 0)
+            with open(out_path + ".impall") as f:
+                result["impall"] = json.load(f)
+            os.unlink(out_path + ".impall")
+        except BaseException:  # noqa: BLE001
+            pass
     if fp_pid:
         try:
             _, st = os.waitpid(fp_pid, 0)
@@ -3495,6 +3596,7 @@ def main():
                    "modules": [m for m in a.sqlglot_modules if m], "gain": 0,
                    "est_wall": 0.0, "max_wall": 10.0}
             jobs.append(job)
+            cjob[c] = job
         job["impfp"] = True
         job["imp_excuse"] = [] if a.imp_strict else sorted(set(a.imp_excuse))
         keep = p["keep"] + p["proxy"]
@@ -3525,6 +3627,25 @@ def main():
         job["max_wall"] += 60.0
         log(f"{c}: collection check")
 
+    for c in commits:
+        a = analyses[c]
+        if not a.imp_check or a.full or not a.applied:
+            continue
+        if not verify_on:
+            plan[c]["keep"] = list(range(n))
+            continue
+        if cjob.get(c) is not None:
+            cjob[c]["imp_all"] = True
+        if cjob.get(c) is None:
+            # nothing else runs the patched tree: import it once, alone
+            job = {"commit": c, "ids": [], "limits": {}, "secs": [], "patched": a.patched,
+                   "modules": [m for m in a.sqlglot_modules if m],
+                   "gain": pack_cost(list(range(n)), dur), "imp_all": True,
+                   "est_wall": 1.0, "max_wall": 20.0}
+            jobs.append(job)
+            cjob[c] = job
+            log(f"{c}: import check")
+
     results: dict = {}
     if jobs:
         jobs.sort(key=lambda j: -j["gain"] / (j["est_wall"] + 1.0))
@@ -3546,6 +3667,28 @@ def main():
                 f"{(res or {}).get('imp_err', '')}")
             if not imp_ok:
                 out |= set(p["imp"])
+        if a.imp_check and not a.full and a.applied and verify_on:
+            res2 = res or {}
+            bad = set(res2.get("leaf_failed") or [])
+            if "impall" in res2 and ("failed" in res2 or bad):
+                bad |= set(res2["impall"])
+                rels = []
+                for mod in sorted(bad):
+                    base = mod.replace(".", "/")
+                    hit = [r for r in (base + ".py", base + "/__init__.py")
+                           if r in a.patched or os.path.isfile(os.path.join(SRC, r))]
+                    rels += hit[:1]
+                if len(rels) == len(bad):
+                    for r in rels:
+                        out |= set(bits_list(an.module_rule(r)))
+                    if bad:
+                        log(f"{c}: {len(bad)} modules do not import: {sorted(bad)[:4]}")
+                else:
+                    out = set(range(n))
+            else:
+                why = res2.get("import_error") or res2.get("error") or "unchecked"
+                log(f"{c}: patched import not confirmed: {why}")
+                out = set(range(n))
         if p["proxy"]:
             ok = set(res.get("proxy_ok", [])) if res and "failed" in res else set()
             if p["impfp"] and not imp_ok:
