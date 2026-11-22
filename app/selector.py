@@ -169,6 +169,15 @@ LINK_MODE_RE = re.compile(
 r"(?:new file mode|deleted file mode|old mode|new mode) 0*1[26]0000\b|index \S+ 0*1[26]0000\b")
 
 
+def _def_annotations(node) -> list:
+    """Parameter and return annotations of a def, in source order."""
+    a = node.args
+    out = [x.annotation for x in a.posonlyargs + a.args + a.kwonlyargs]
+    out += [x.annotation for x in (a.vararg, a.kwarg) if x is not None]
+    out.append(node.returns)
+    return [x for x in out if x is not None]
+
+
 def _import_time_effects(text: str):
     """What a module does when it is imported, apart from defining names:
     every call and every store into an attribute or an item that runs
@@ -189,6 +198,9 @@ def _import_time_effects(text: str):
             for d in node.decorator_list:
                 walk(d)
             for d in node.args.defaults + [x for x in node.args.kw_defaults if x is not None]:
+                walk(d)
+            # annotations run when the def statement runs
+            for d in _def_annotations(node) + list(getattr(node, "type_params", ())):
                 walk(d)
             return
         if isinstance(node, ast.Lambda):
@@ -227,14 +239,16 @@ def _import_time_effects(text: str):
 _OK_IMPORT_ROOTS = frozenset(getattr(sys, "stdlib_module_names", ())) | {"sqlglot", "tests"}
 
 
-def _test_module_frame(text: str):
+def _test_module_frame(text: str, binds: dict | None = None):
     """Everything in a test module except what a test file may change freely:
     bodies of test_* functions and methods, new undecorated test_* functions,
     new plain Test* classes, docstrings, and plain imports of the standard
     library, sqlglot or tests. pytest imports every test module before it
     runs anything, so whatever else a test file changes at module or class
     level (assignments, decorators, fixtures, hooks, setUp, helpers, plugin
-    lists) may reach the whole session. None when the text does not parse."""
+    lists) may reach the whole session. None when the text does not parse.
+    With binds, the names the free imports bind are collected there, each
+    with its sources in order, and "" maps to every identifier in the text."""
     try:
         tree = ast.parse(text)
     except (SyntaxError, ValueError, RecursionError):
@@ -243,6 +257,12 @@ def _test_module_frame(text: str):
 
     def note(k):
         out[k] = out.get(k, 0) + 1
+
+    def bind(st):
+        mod = ("." * st.level + (st.module or "")) if isinstance(st, ast.ImportFrom) else None
+        for al in st.names:
+            src = f"import {al.name} as {al.asname}" if mod is None else f"from {mod} import {al.name}"
+            binds.setdefault(al.asname or al.name.split(".")[0], []).append(src)
 
     def plain_import(st) -> bool:
         if isinstance(st, ast.Import):
@@ -278,12 +298,21 @@ def _test_module_frame(text: str):
             if isinstance(st, ast.Pass):
                 continue
             if plain_import(st) and not in_test_class:
+                if binds is not None:
+                    bind(st)
                 continue
             if isinstance(st, (ast.FunctionDef, ast.AsyncFunctionDef)) and st.name.startswith("test_"):
                 a = st.args
-                if st.decorator_list or a.defaults or any(x is not None for x in a.kw_defaults):
+                # only the body is free. Decorators, default values and
+                # annotations run at import, a literal annotation runs nothing
+                live = [x for x in _def_annotations(st) if not isinstance(x, ast.Constant)]
+                tps = list(getattr(st, "type_params", ()))
+                if st.decorator_list or a.defaults or any(x is not None for x in a.kw_defaults) or live or tps:
                     hdr = ast.dump(ast.Module(body=[], type_ignores=[])) + "|".join(
                         ast.dump(d) for d in st.decorator_list) + ast.dump(a)
+                    if live or tps:
+                        hdr += "->" + (ast.dump(st.returns) if st.returns is not None else "") + "|".join(
+                            ast.dump(d) for d in tps)
                     note(f"{where}/def {st.name}:{hdr}")
                 continue
             if isinstance(st, ast.ClassDef) and st.name.startswith("Test") and not in_test_class \
@@ -293,7 +322,39 @@ def _test_module_frame(text: str):
             note(f"{where}:{ast.dump(st)}")
 
     body(tree.body, "", False)
+    if binds is not None:
+        used = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Name):
+                used.add(node.id)
+            elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                used.add(node.name)
+            elif isinstance(node, ast.arg):
+                used.add(node.arg)
+            elif isinstance(node, ast.alias):
+                used.add(node.asname or node.name.split(".")[0])
+            elif isinstance(node, (ast.Global, ast.Nonlocal)):
+                used.update(node.names)
+            elif isinstance(node, ast.ExceptHandler) and node.name:
+                used.add(node.name)
+        binds[""] = used
     return out
+
+
+def _import_binds_differ(was: dict, now: dict) -> bool:
+    """Whether the free imports of a test module rebind a name. A decorator,
+    a default, a base class or a helper may read an imported name at import,
+    and other test modules import names from this one. So a binding that is
+    removed or gets another source reaches the session. A binding under a
+    name the old module never mentions can only be read by a test body."""
+    known = was.get("", set())
+    for name, src in was.items():
+        if name and now.get(name) != src:
+            return True
+    for name in now:
+        if name and name not in was and name in known:
+            return True
+    return False
 
 
 def parse_patch(text: str) -> list[FileDiff]:
@@ -2849,11 +2910,17 @@ class Analyzer:
                 a.full = True
                 a.reasons.append(f"import-time code in {new_rel}")
                 return
-            was = _test_module_frame(old_text) if old_rel is not None else {}
-            now = _test_module_frame(new_text)
+            wb: dict = {}
+            nb: dict = {}
+            was = _test_module_frame(old_text, wb) if old_rel is not None else {}
+            now = _test_module_frame(new_text, nb)
             if was is None or now is None or was != now:
                 a.full = True
                 a.reasons.append(f"test module frame changed in {new_rel}")
+                return
+            if _import_binds_differ(wb, nb):
+                a.full = True
+                a.reasons.append(f"import binding changed in {new_rel}")
                 return
         if new_rel is not None and new_rel.startswith("sqlglot/") and not new_rel.endswith(".py") \
                 and old_rel != new_rel:
