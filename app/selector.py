@@ -69,6 +69,29 @@ TPC_IDS = ("tests/test_executor.py::TestExecutor::test_execute_tpcds",
            "tests/test_executor.py::TestExecutor::test_execute_tpch",
            "tests/test_executor.py::TestExecutor::test_optimized_tpch")
 TPC_FIXTURES = {"tests/fixtures/optimizer/tpc-ds/tpc-ds.sql", "tests/fixtures/optimizer/tpc-h/tpc-h.sql"}
+# what test_execute_tpcds loads from tests/ besides the package itself
+RISK_TEST_LIVE = {"tests/test_executor.py", "tests/helpers.py", "tests/__init__.py"}
+
+
+# top-level folders of the pinned tree that hold Python files. A .py file
+# under any other top-level folder is a new package on the test path.
+KNOWN_TOP = ("sqlglot", "tests", "sqlglotc", "benchmarks", "pdoc", "posts", "docs",
+             "sqlglot-integration-tests", ".github")
+
+
+def risk_inert(rel):
+    """A patched text file the TPC-DS test never reads, so a sampled replay
+    of it says as much as it does for a package-only commit."""
+    if rel.endswith(".md") or rel.startswith("docs/") or rel.startswith("posts/"):
+        return True
+    if not rel.startswith("tests/") or rel in RISK_TEST_LIVE:
+        return False
+    if rel.rsplit("/", 1)[-1] == "conftest.py":
+        return False
+    if rel.startswith("tests/fixtures/optimizer/tpc-ds/") \
+            or rel.startswith("tests/fixtures/optimizer/tpc-h/"):
+        return False
+    return rel.endswith((".py", ".sql", ".yml", ".yaml", ".json", ".txt", ".csv"))
 
 CONFIG_FILES = {"pyproject.toml", "setup.cfg", "pytest.ini", "tox.ini", "conftest.py", "setup.py",
                 ".pytest.ini", "pytest.toml", ".pytest.toml"}
@@ -142,6 +165,137 @@ def _lines(text: str) -> list[str]:
     return out
 
 
+LINK_MODE_RE = re.compile(
+r"(?:new file mode|deleted file mode|old mode|new mode) 0*1[26]0000\b|index \S+ 0*1[26]0000\b")
+
+
+def _import_time_effects(text: str):
+    """What a module does when it is imported, apart from defining names:
+    every call and every store into an attribute or an item that runs
+    outside a function body. Decorators, default values and class bodies
+    count, they run at import. None when the text does not parse."""
+    try:
+        tree = ast.parse(text)
+    except (SyntaxError, ValueError, RecursionError):
+        return None
+    out: dict = {}
+
+    def note(node):
+        k = ast.dump(node)
+        out[k] = out.get(k, 0) + 1
+
+    def walk(node):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            for d in node.decorator_list:
+                walk(d)
+            for d in node.args.defaults + [x for x in node.args.kw_defaults if x is not None]:
+                walk(d)
+            return
+        if isinstance(node, ast.Lambda):
+            for d in node.args.defaults + [x for x in node.args.kw_defaults if x is not None]:
+                walk(d)
+            return
+        if isinstance(node, ast.Call):
+            note(node)
+        elif isinstance(node, (ast.Attribute, ast.Subscript)) and isinstance(node.ctx, (ast.Store, ast.Del)):
+            note(node)
+        elif isinstance(node, (ast.Global, ast.Nonlocal)):
+            note(node)
+        for ch in ast.iter_child_nodes(node):
+            walk(ch)
+
+    walk(tree)
+    # names pytest itself reads from a test module: a plugin list makes
+    # plain hook functions session-wide, with no call at import
+    special = ("pytest_plugins", "pytestmark", "collect_ignore", "collect_ignore_glob")
+    for node in ast.walk(tree):
+        name = None
+        if isinstance(node, ast.Name) and not isinstance(node.ctx, ast.Load):
+            name = node.id
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            name = node.name
+        elif isinstance(node, ast.alias):
+            name = node.asname or node.name.split(".")[0]
+        elif isinstance(node, ast.arg):
+            name = node.arg
+        if name is not None and (name in special or name.startswith("pytest_")):
+            k = "name:" + name + ":" + ast.dump(node)
+            out[k] = out.get(k, 0) + 1
+    return out
+
+
+_OK_IMPORT_ROOTS = frozenset(getattr(sys, "stdlib_module_names", ())) | {"sqlglot", "tests"}
+
+
+def _test_module_frame(text: str):
+    """Everything in a test module except what a test file may change freely:
+    bodies of test_* functions and methods, new undecorated test_* functions,
+    new plain Test* classes, docstrings, and plain imports of the standard
+    library, sqlglot or tests. pytest imports every test module before it
+    runs anything, so whatever else a test file changes at module or class
+    level (assignments, decorators, fixtures, hooks, setUp, helpers, plugin
+    lists) may reach the whole session. None when the text does not parse."""
+    try:
+        tree = ast.parse(text)
+    except (SyntaxError, ValueError, RecursionError):
+        return None
+    out: dict = {}
+
+    def note(k):
+        out[k] = out.get(k, 0) + 1
+
+    def plain_import(st) -> bool:
+        if isinstance(st, ast.Import):
+            mods = [al.name for al in st.names]
+        elif isinstance(st, ast.ImportFrom):
+            if st.level:
+                return False
+            mods = [st.module or ""]
+        else:
+            return False
+        for al in st.names:
+            bound = al.asname or al.name.split(".")[0]
+            if al.name == "*" or bound.startswith(("pytest_", "__")) or bound in (
+                    "pytestmark", "collect_ignore", "collect_ignore_glob"):
+                return False
+        return all(m.split(".")[0] in _OK_IMPORT_ROOTS for m in mods)
+
+    def simple_bases(cl) -> bool:
+        if cl.decorator_list or cl.keywords:
+            return False
+        for b in cl.bases:
+            x = b
+            while isinstance(x, ast.Attribute):
+                x = x.value
+            if not isinstance(x, ast.Name):
+                return False
+        return True
+
+    def body(stmts, where, in_test_class):
+        for i, st in enumerate(stmts):
+            if isinstance(st, ast.Expr) and isinstance(st.value, ast.Constant) and i == 0:
+                continue  # docstring
+            if isinstance(st, ast.Pass):
+                continue
+            if plain_import(st) and not in_test_class:
+                continue
+            if isinstance(st, (ast.FunctionDef, ast.AsyncFunctionDef)) and st.name.startswith("test_"):
+                a = st.args
+                if st.decorator_list or a.defaults or any(x is not None for x in a.kw_defaults):
+                    hdr = ast.dump(ast.Module(body=[], type_ignores=[])) + "|".join(
+                        ast.dump(d) for d in st.decorator_list) + ast.dump(a)
+                    note(f"{where}/def {st.name}:{hdr}")
+                continue
+            if isinstance(st, ast.ClassDef) and st.name.startswith("Test") and not in_test_class \
+                    and simple_bases(st):
+                body(st.body, f"{where}/{st.name}", True)
+                continue
+            note(f"{where}:{ast.dump(st)}")
+
+    body(tree.body, "", False)
+    return out
+
+
 def parse_patch(text: str) -> list[FileDiff]:
     files: list[FileDiff] = []
     cur = None
@@ -166,6 +320,10 @@ def parse_patch(text: str) -> list[FileDiff]:
             cur.new = _strip_prefix(lines[i + 1][4:])
             i += 2
             continue
+        if cur is not None and LINK_MODE_RE.match(line):
+            # a symlink or a submodule entry: its text is a target, not a
+            # file body, and it can stand in for a module. Select every test
+            cur.binary = True
         if cur is not None and line.startswith(("new file mode", "deleted file mode")):
             if line.startswith("new"):
                 cur.old = None
@@ -174,6 +332,12 @@ def parse_patch(text: str) -> list[FileDiff]:
             i += 1
             continue
         if cur is not None and (line.startswith("Binary files") or line.startswith("GIT binary patch")):
+            cur.binary = True
+            i += 1
+            continue
+        if cur is not None and line.startswith(("copy from ", "copy to ")):
+            # a copied file is a new module nobody mapped: handled like a
+            # binary change, which selects every test
             cur.binary = True
             i += 1
             continue
@@ -1127,6 +1291,7 @@ class Analysis:
         self.imp_strict = False
         self.equiv = ([], {})  # see site_equiv; None once any change is not of that kind
         self.equiv_files: set = set()
+        self.tpc_inert: list = []  # patched files outside sqlglot/ the TPC tests never read
         self.collect = False  # a new conftest only drops collected items: collect to see which
         # a package module changed outside function bodies: its import runs
         # the change, and a module that no longer imports fails every test
@@ -1185,10 +1350,72 @@ class Analyzer:
         self._reach_cache = None
         self._tree_cache = None
         self.warned = None  # tests that raise a warning on the pinned tree
+        self._inert_probe = None  # rel under a tpc_inert probe
         try:
             self.warned = json.loads(gzip.decompress(open(os.path.join(APP, "warn.json.gz"), "rb").read()))
         except Exception:  # noqa: BLE001
             pass
+
+    def tpc_inert(self, fd) -> str | None:
+        """Why the replayed TPC tests provably never see this patched file
+        outside sqlglot/, or None. Proof is the map recorded on the pinned
+        tree: no TPC test (its collection, setup, call and pool workers,
+        traced in process) opened the file or ran a line of it, nothing it
+        imports reaches it, and the file's own rules select no TPC test."""
+        rel = fd.old
+        if fd.binary or rel is None or fd.new != rel or not fd.hunks:
+            return None
+        if rel.startswith(("sqlglot/", "sqlglotrs/", "sqlglotc/")) or rel in TPC_FIXTURES \
+                or rel.startswith(("tests/fixtures/optimizer/tpc-ds/", "tests/fixtures/optimizer/tpc-h/")):
+            return None
+        base = os.path.basename(rel)
+        if base in CONFIG_FILES or base == "__init__.py" or rel in RISK_TEST_LIVE:
+            return None
+        if not os.path.isfile(os.path.join(SRC, rel)) or os.path.islink(os.path.join(SRC, rel)):
+            return None
+        mp = self.mp
+        why = None
+        tpc = 0
+        for tid in TPC_IDS:
+            n = mp.num_of_id.get(tid)
+            if n is None:
+                tpc = None
+                break
+            tpc |= 1 << n
+        # the map must know all three tests, and none may run a child process
+        # it could not trace
+        if tpc and not tpc & mp.unknown and not tpc & mp.spawn \
+                and not (mp.opened_tests(rel) | mp.file_tests(rel)) & tpc:
+            ok = True
+            if rel.endswith(".py"):
+                # anything that imports it, at any depth, must be as clean
+                seen, queue = {rel}, [rel]
+                while queue and ok:
+                    x = queue.pop()
+                    if x in RISK_TEST_LIVE or os.path.basename(x) in CONFIG_FILES \
+                            or os.path.basename(x) == "__init__.py" \
+                            or (mp.by_file.get(x, 0) | mp.opened_tests(x) | mp.file_tests(x)) & tpc:
+                        ok = False
+                    for imp in self.importers.get(x, []):
+                        if imp not in seen:
+                            seen.add(imp)
+                            queue.append(imp)
+            if ok:
+                # the file's own analysis, alone: it must stay exact, not
+                # select everything, and reach no TPC test
+                probe = Analysis("probe")
+                self._inert_probe = rel
+                try:
+                    self.analyze_file(probe, fd)
+                except Exception:  # noqa: BLE001
+                    probe.full = True
+                finally:
+                    self._inert_probe = None
+                if probe.applied and not probe.full and probe.rsafe and not probe.rq \
+                        and not probe.gone and not probe.collect and not probe.imp_check \
+                        and not (probe.cand | probe.imp) & tpc:
+                    why = f"{rel} unread by the TPC tests"
+        return why
 
     # rules -------------------------------------------------------------
     def module_rule(self, rel: str) -> int:
@@ -2466,9 +2693,30 @@ class Analyzer:
             a.applied = False
             a.reasons.append(f"unparseable patch: {e}")
             return a
+        if "\r" in text:
+            # a carriage return in a patch: line splitting here and in the
+            # tool that applies it may differ, so nothing is concluded
+            a.full = True
+            a.applied = False
+            a.reasons.append("carriage return in patch")
+            return a
         if not diffs:
+            if text.strip():
+                # text the parser found no file in: not understood
+                a.full = True
+                a.applied = False
+                a.reasons.append("patch with no file diff")
+                return a
             a.reasons.append("empty patch")
             return a
+        for fd in diffs:
+            if not fd.hunks and not fd.binary and fd.old == fd.new:
+                # a block with no hunk the parser knows (combined diff, mode
+                # only, unknown header): not understood
+                a.full = True
+                a.applied = False
+                a.reasons.append(f"no hunks for {fd.new}")
+                return a
         # patch applies two blocks for one path in turn; here each block is
         # applied to the pinned text and only the last would be kept
         seen: set = set()
@@ -2501,7 +2749,15 @@ class Analyzer:
             a.tpcds_only = True
         elif fd.binary or old_rel != new_rel or not (rel or "").startswith("sqlglot/") \
                 or not rel.endswith(".py"):
-            a.rsafe = False
+            # a file the TPC tests provably never read leaves the replay exact
+            if rel is not None and rel == self._inert_probe:
+                pass
+            else:
+                why = self.tpc_inert(fd)
+                if why is None:
+                    a.rsafe = False
+                else:
+                    a.tpc_inert.append(why)
         if old_rel and old_rel != new_rel and old_rel.startswith("sqlglot/"):
             a.gone = True  # a package file was deleted or renamed
         if fd.binary:
@@ -2509,6 +2765,18 @@ class Analyzer:
             a.applied = False
             a.reasons.append(f"binary {rel}")
             return
+        for r in (old_rel, new_rel):
+            # code every test process can load without any test naming it:
+            # a root-level module (sitecustomize and the like, the checkout
+            # is on the path), the optional sqlglotrs package, path files
+            # and installed-package metadata
+            if r and ((r.endswith(".py") and "/" not in r and r != "setup.py")
+                      or (r.endswith(".py") and "/" in r and r.split("/", 1)[0] not in KNOWN_TOP)
+                      or r.startswith("sqlglotrs/") or r.endswith(".pth")
+                      or ".dist-info/" in r or ".egg-info/" in r):
+                a.full = True
+                a.reasons.append(f"root-level code {r}")
+                return
         old_text = ""
         if old_rel is not None:
             p = os.path.join(SRC, old_rel)
@@ -2560,6 +2828,30 @@ class Analyzer:
                 a.reasons.append(f"config {r}")
                 return
 
+        if new_rel is not None and new_rel.startswith("tests/") and new_rel.endswith(".py"):
+            # pytest imports every test module before it runs anything, so
+            # code a test module runs at import reaches the whole session
+            # (logging.disable, a started mock, a recursion limit)
+            was = _import_time_effects(old_text) if old_rel is not None else {}
+            now = _import_time_effects(new_text)
+            if was is None or now is None or any(n > was.get(k, 0) for k, n in now.items()):
+                a.full = True
+                a.reasons.append(f"import-time code in {new_rel}")
+                return
+            was = _test_module_frame(old_text) if old_rel is not None else {}
+            now = _test_module_frame(new_text)
+            if was is None or now is None or was != now:
+                a.full = True
+                a.reasons.append(f"test module frame changed in {new_rel}")
+                return
+        if new_rel is not None and new_rel.startswith("sqlglot/") and not new_rel.endswith(".py") \
+                and old_rel != new_rel:
+            # a new non-Python file in the package can stand in for a module
+            # (extension suffix, a link) or be picked up by a directory scan
+            a.full = True
+            a.reasons.append(f"new package file {new_rel}")
+            return
+
         # directory listings see added or removed files
         if old_rel != new_rel:
             for r in {old_rel, new_rel} - {None}:
@@ -2585,12 +2877,12 @@ class Analyzer:
                 a.full = True
                 a.reasons.append(f"new file {new_rel} shadows a module")
                 return
-            # a new module only matters once something imports it, and that
-            # importer is itself a change; listings were handled above.
             if new_rel.startswith("sqlglot/"):
-                a.sqlglot_modules.append(module_name(new_rel))
-                a.imp_check = True
-                a.imp_order = True
+                # tests that walk the package or its registries see a new
+                # module without any importer changing, so no map covers it
+                a.full = True
+                a.reasons.append(f"new module {new_rel}")
+                return
             a.broad |= mp.by_file.get(new_rel, 0)
             try:
                 new_tree = ast.parse(new_text)
@@ -2601,6 +2893,11 @@ class Analyzer:
                 leak_rule(a, new_rel, empty, new_tree, diff_ast(empty, new_tree))
             return
         if old_rel is not None and new_rel is not None and old_rel != new_rel:
+            if new_rel.startswith("sqlglot/") and new_rel.endswith(".py"):
+                # a module under a new name in the package: same as a new module
+                a.full = True
+                a.reasons.append(f"renamed into package {new_rel}")
+                return
             for r in (old_rel, new_rel):
                 if r.endswith(".py"):
                     a.cand |= self.module_rule(r) if r == old_rel else 0
@@ -4668,161 +4965,6 @@ class Verifier:
 # ---------------------------------------------------------------- main
 
 
-# ---------------------------------------------------------------- markers
-# BLAST_MARK=1: a diagnostic build. After the final selection and packing,
-# the busiest worker of a commit grows by exactly W ms, W the sum of the
-# weights of the classes below, so the board total carries the counts.
-MARK_A, MARK_B, MARK_C, MARK_D = 1, 16, 256, 4096
-MARK_MODE = os.environ.get("BLAST_MARK", "")
-
-
-def mark2_tpcds(p, res, in_sel, tpn):
-    """BLAST_MARK=2: (weight, value, reason) for a commit that keeps TPC-DS.
-    1s digit: the risk gate that failed. 16s: the risk sample saw a digest
-    differ (1 front end or test process, 2 worker plan, 3 result table,
-    9 cannot tell). 256s: another stop (1 raise, 2 over CPU or no result,
-    3 the exact replay found a difference first, 9 other)."""
-    g = p.get("risk_gate")
-    if g:
-        return 1, g, f"risk gate {g} failed; tp_path {p.get('tp_path', '')}"
-    if g is None:
-        return 256, 9, "risk gate not evaluated"
-    if not in_sel:
-        return 256, 9, "slack fill only"
-    if tpn not in p.get("proxy", []):
-        return 256, 9, f"risk gate passed but no replay job; tp_path {p.get('tp_path', '')}"
-    if res is None or "failed" not in res:
-        return 256, 2, f"replay job gave no result ({(res or {}).get('error', 'out of time')})"[:160]
-    info = (res.get("proxy_info") or {}).get(TPCDS_ID, {})
-    if TPCDS_ID in (res.get("proxy_ok") or []):
-        return 256, 9, "replay cleared, import state differs"
-    stop = str(info.get("stop", ""))
-    rstop = info.get("risk_stop")
-
-    def exc(s):
-        return 2 if s.startswith("Overtime") else 1
-    if rstop is None:
-        if stop.startswith(REPLAY_COST):
-            # risk_tpcds returned False without a stop: cannot happen
-            return 256, 9, f"risk sample: no stop recorded, exact stop {stop}"
-        if stop.startswith(("main", "worker", "table", "shared tables")):
-            return 256, 3, f"exact replay found a difference: {stop}"
-        if ":" in stop:
-            return 256, exc(stop), f"exact replay raised: {stop}"[:160]
-        return 256, 9, f"exact replay stopped: {stop or 'no info'}"
-    rstop = str(rstop)
-    why = f"risk sample stopped: {rstop} (exact: {stop})"[:200]
-    if rstop.startswith(("main", "pair")):
-        return 16, 1, why
-    if rstop.startswith("worker"):
-        return 16, 2, why
-    if rstop.startswith("table"):
-        return 16, 3, why
-    if rstop.startswith("shared tables"):
-        return 16, 9, why
-    if ":" in rstop:
-        return 256, exc(rstop), why
-    return 256, 9, why
-REPLAY_FOUND = ("main", "worker", "table", "shared tables", "pair")
-REPLAY_COST = ("budget", "cap", "projected", "risk only")
-
-
-def mark_tpcds_class(p, res, in_sel, tpn):
-    """'A', 'B' or 'C' and the reason, for a commit that keeps the TPC-DS test."""
-    if not in_sel:
-        return "B", "slack fill only"
-    if tpn in p.get("proxy", []):
-        if res is None or "failed" not in res:
-            return "B", f"replay out of time or no result ({(res or {}).get('error', 'no result')})"[:160]
-        info = (res.get("proxy_info") or {}).get(TPCDS_ID, {})
-        if TPCDS_ID in (res.get("proxy_ok") or []):
-            return "B", "replay cleared, import state differs"
-        stop = str(info.get("risk_stop") or info.get("stop") or "")
-        if stop.startswith(REPLAY_FOUND):
-            return "C", f"replay did not clear: {stop}"
-        if stop.startswith(REPLAY_COST) or stop in ("setup", "pairs") or not stop:
-            return "B", f"replay stopped: {stop or 'no info'} {info.get('risk_stop', '')}".strip()
-        # a raise or an overtime inside a query: the query fails
-        return "C", f"replay raised: {stop}"[:160]
-    why = p.get("tp_path", "")
-    if why.startswith("not replayable"):
-        return "A", why
-    if why.startswith("replay skipped at planning"):
-        return "B", why
-    return "B", f"other path: {why or 'not a replay candidate'}"
-
-
-def mark_commit(c, a, p, res, sel, workers, ids, dur, n):
-    sel_all = a.full or len(sel) >= n - 5
-    chosen = {t for w in workers for t in w}
-    num = {v: k for k, v in ids.items()}
-    tpn, mxn = num.get(TPCDS_ID), num.get(MAXNODES_ID)
-    cls, notes, w_ms = [], [], 0
-    if not sel_all and tpn is not None and tpn in chosen:
-        if MARK_MODE == "2":
-            wt, v, why = mark2_tpcds(p, res, tpn in sel, tpn)
-            cls.append(f"{wt}x{v}")
-            notes.append(f"tpcds {why}")
-            w_ms += wt * v
-        else:
-            k, why = mark_tpcds_class(p, res, tpn in sel, tpn)
-            cls.append(k)
-            notes.append(f"tpcds {why}")
-            w_ms += {"A": MARK_A, "B": MARK_B, "C": MARK_C}[k]
-    if not sel_all and mxn is not None and mxn in chosen:
-        cls.append("D")
-        notes.append("max_nodes " + ("slack fill only" if mxn not in sel else "selected"))
-        w_ms += MARK_D
-    if w_ms:
-        # free tests below 3 s, largest first, then exact by the many short ones
-        loads = [sum(dur[t] for t in w) for w in workers]
-        top = loads.index(max(loads))
-        # tests outside the selection: unused ones first, then slack fill
-        # sitting on another worker (moved, so the output's test set stays)
-        home = {t: i for i, w in enumerate(workers) for t in w}
-        sel_set = set(sel)
-        pool = sorted((t for t in range(n) if t not in sel_set and home.get(t) != top
-                       and 0 < dur[t] < 3000),
-                      key=lambda t: (-dur[t], t in home, t))
-        pick, left = [], w_ms
-        for t in pool:
-            if dur[t] <= left:
-                pick.append(t)
-                left -= dur[t]
-                if not left:
-                    break
-        if left:
-            # exact subset sum over the pool
-            reach = {0: None}
-            for t in pool:
-                for s in sorted(reach, reverse=True):
-                    s2 = s + dur[t]
-                    if s2 <= w_ms and s2 not in reach:
-                        reach[s2] = (s, t)
-                if w_ms in reach:
-                    break
-            if w_ms in reach:
-                pick, s = [], w_ms
-                while s:
-                    s, t = reach[s]
-                    pick.append(t)
-                left = 0
-        if left:
-            log(f"{c}: mark FAILED, {left} ms short of {w_ms}")
-        else:
-            moved = 0
-            for t in pick:
-                if t in home:
-                    workers[home[t]].remove(t)
-                    moved += 1
-            workers[top].extend(pick)
-            if not all(workers):
-                log(f"{c}: mark emptied a worker")
-            notes.append(f"{len(pick)} markers, {moved} moved from slack")
-    log(f"{c}: mark classes={''.join(cls) or '-'} W={w_ms} "
-        f"{'select everything ' if sel_all else ''}{'; '.join(notes)}")
-
-
 def main():
     if len(sys.argv) > 1 and sys.argv[1] == "--build-index":
         idx = build_index(SRC)
@@ -4900,7 +5042,11 @@ def main():
     analyses: dict = {}
     for c in commits:
         try:
-            text = open(os.path.join(commits_dir, c + ".patch"), encoding="utf-8", errors="surrogateescape").read()
+            if time.monotonic() - T0 > 0.5 * wall_limit:
+                raise TimeoutError("analysis out of time")
+            # newline="": a lone CR inside a line stays in that line, as git apply reads it
+            text = open(os.path.join(commits_dir, c + ".patch"), encoding="utf-8", errors="surrogateescape",
+                        newline="").read()
             a = an.analyze(c, text)
         except Exception as e:  # noqa: BLE001
             a = Analysis(c)
@@ -4992,6 +5138,9 @@ def main():
                 plan[c]["tp_path"] = "no proxy baseline or tpcds_only filter"
             else:
                 plan[c]["tp_path"] = "replay planned"
+            if a.tpc_inert and not a.full:
+                plan[c]["tp_path"] += f" [inert: {'; '.join(a.tpc_inert)}]"
+                log(f"{c}: {plan[c]['tp_path']}")
         if tp and an.rq is not None:
             fixture = "tests/fixtures/optimizer/tpc-ds/tpc-ds.sql" in a.patched
             if not (a.fq_all or an.rq.front is None):
@@ -5014,21 +5163,10 @@ def main():
         # the risk dial: a TPC-DS test no proof will clear gets a sampled replay
         risk = None
         tpn = num_of_id.get(TPCDS_ID)
-        if MARK_MODE == "2":
-            # diagnostic only: the first risk gate below that fails
-            gates = [an.rq is None, not verify_on, a.full, not a.applied,
-                     not (tpn in proxy_nums and tpn in cand), a.gone, a.collect,
-                     not all(r in TPC_FIXTURES or (r.startswith("sqlglot/") and r.endswith(".py"))
-                             for r in a.patched)]
-            g = next((i + 1 for i, f in enumerate(gates) if f), 0)
-            if not g and RISK_BUDGET > 0:
-                rg = pack_cost(cand, dur) - pack_cost([t for t in cand if t != tpn], dur)
-                g = 0 if rg / 1000 > RISK_BUDGET + 1.0 else 9
-            plan[c]["risk_gate"] = g
         if RISK_BUDGET > 0 and an.rq is not None and verify_on and not a.full and a.applied \
                 and tpn in proxy_nums and tpn in cand and not a.gone and not a.collect \
                 and all(r in TPC_FIXTURES or (r.startswith("sqlglot/") and r.endswith(".py"))
-                        for r in a.patched):
+                        or risk_inert(r) for r in a.patched):
             r_gain = pack_cost(cand, dur) - pack_cost([t for t in cand if t != tpn], dur)
             if r_gain / 1000 > RISK_BUDGET + 1.0:
                 fr = None if (a.fq_all or an.rq.front is None
@@ -5276,7 +5414,6 @@ def main():
         results = ver.results
 
     num_of = {v: k for k, v in ids.items()}
-    mark_on = MARK_MODE in ("1", "2")
     total = 0
     for c in commits:
         a = analyses[c]
@@ -5380,11 +5517,38 @@ def main():
             rest = [t for t in sorted(range(n), key=lambda t: dur[t]) if t not in out and not (a.cand | a.broad) >> t & 1]
             workers = fill_slack(workers, loads, extra + rest, dur)
         workers = [w for w in workers if w]
-        if mark_on and workers:
-            mark_commit(c, a, p, res, sel, workers, ids, dur, n)
         print(json.dumps({"commit": c, "workers": workers}), flush=True)
+        PRINTED.add(c)
     log(f"done, simulated estimate {total / 1000:.1f}s")
 
 
+PRINTED: set = set()
+
+
+def fallback_all(err):
+    """Any error in main: every commit without a line yet gets every test."""
+    log(f"main failed ({type(err).__name__}: {err}), selecting every test for the rest")
+    tests = json.loads(open(os.path.join(DATA, "tests.json")).read())["tests"]
+    nums = sorted(t["number"] for t in tests)
+    dur = [0] * (max(nums) + 1 if nums else 0)
+    for t in tests:
+        dur[t["number"]] = round(t["seconds"] * 1000)
+    try:
+        workers = [w for w in best_pack(nums, dur)[0] if w]
+    except Exception:  # noqa: BLE001
+        workers = [nums]
+    cdir = os.path.join(DATA, "commits")
+    for c in sorted(f[:-6] for f in os.listdir(cdir) if f.endswith(".patch")):
+        if c not in PRINTED:
+            print(json.dumps({"commit": c, "workers": workers}), flush=True)
+            PRINTED.add(c)
+
+
 if __name__ == "__main__":
-    main()
+    MAIN_PID = os.getpid()
+    try:
+        main()
+    except BaseException as e:  # noqa: BLE001
+        if os.getpid() != MAIN_PID or "--build-index" in sys.argv[1:]:
+            raise
+        fallback_all(e)
