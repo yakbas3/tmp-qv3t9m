@@ -240,6 +240,9 @@ def _import_time_effects(text: str):
 _OK_IMPORT_ROOTS = frozenset(getattr(sys, "stdlib_module_names", ())) | {"sqlglot", "tests"}
 
 
+_TEST_BASES = {"unittest.TestCase", "TestCase", "Validator"}
+
+
 def _test_module_frame(text: str, binds: dict | None = None):
     """Everything in a test module except what a test file may change freely:
     bodies of test_* functions and methods, new undecorated test_* functions,
@@ -290,6 +293,10 @@ def _test_module_frame(text: str, binds: dict | None = None):
                 x = x.value
             if not isinstance(x, ast.Name):
                 return False
+            # a base may run code when the class is made (a registry
+            # metaclass, __init_subclass__): only plain test bases are free
+            if ast.unparse(b) not in _TEST_BASES:
+                return False
         return True
 
     def body(stmts, where, in_test_class):
@@ -318,6 +325,7 @@ def _test_module_frame(text: str, binds: dict | None = None):
                 continue
             if isinstance(st, ast.ClassDef) and st.name.startswith("Test") and not in_test_class \
                     and simple_bases(st):
+                note(f"{where}/class {st.name}:" + ",".join(ast.unparse(x) for x in st.bases))
                 body(st.body, f"{where}/{st.name}", True)
                 continue
             note(f"{where}:{ast.dump(st)}")
@@ -2415,7 +2423,7 @@ class Analyzer:
                     continue
                 if tag == "replace":
                     for (ko, _vo), (kn, vn) in zip(olds, news):
-                        if ko is None or kn is None or ko is _vo or _dump(ko) != _dump(kn) or not _plain_value(vn):
+                        if ko is None or kn is None or ko is _vo or _dump(ko) != _dump(kn) or not _literal(vn):
                             return None
                 for k, v in olds:
                     rec = recorded.get(espan(k, v))
