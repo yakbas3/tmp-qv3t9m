@@ -56,6 +56,7 @@ RISK_ORDER = os.environ.get("BLAST_TPCDS_RISK_ORDER", "targeted")
 # Off by default, not a proof: test_max_nodes (29 s) checked by a stand-in
 # that runs its body at 1/25 scale (max_nodes_standin).
 STANDIN_ON = os.environ.get("BLAST_STANDIN", "0") == "1"
+KEYSTRICT = os.environ.get("BLAST_KEYSTRICT", "1") == "1"
 MAXNODES_ID = "tests/test_parser.py::TestParser::test_max_nodes"
 STANDIN_CPU = 1.5  # what the stand-in costs on the pinned tree, CPU s
 # Off: r_class does not yet follow a class attribute read through a class
@@ -2399,6 +2400,29 @@ class Analyzer:
             if tag == "equal":
                 continue
             olds, news = oe[i1:i2], ne[j1:j2]
+            if KEYSTRICT:
+                # only entries the recorded map names: deleted, or given a
+                # value that runs nothing at import. A new or renamed key has
+                # no recorded name, and a new expression may fail at import
+                if tag == "insert" or (tag == "replace" and len(olds) != len(news)):
+                    return None
+                if tag == "replace" and len(olds) == 1 and olds[0][0] is None and news[0][0] is None:
+                    d = _comp_key_delta(olds[0][1], news[0][1], hashable)
+                    rec = recorded.get(espan(*olds[0]))
+                    if rec is None or d is None or d[0]:
+                        return None
+                    affected |= rec  # every key of the entry, the delta's names are not trusted
+                    continue
+                if tag == "replace":
+                    for (ko, _vo), (kn, vn) in zip(olds, news):
+                        if ko is None or kn is None or ko is _vo or _dump(ko) != _dump(kn) or not _plain_value(vn):
+                            return None
+                for k, v in olds:
+                    rec = recorded.get(espan(k, v))
+                    if rec is None:
+                        return None
+                    affected |= rec
+                continue
             for k, v in news:
                 if not _import_safe(v, atoms, set()):
                     return None
@@ -4281,6 +4305,18 @@ def _literal(node) -> bool:
         return True
     except Exception:  # noqa: BLE001
         return False
+
+
+def _plain_value(v) -> bool:
+    """A value that runs nothing at import: a literal, or a lambda whose
+    default values are literals."""
+    if _literal(v):
+        return True
+    if isinstance(v, ast.Lambda):
+        a = v.args
+        return all(_literal(d) for d in a.defaults + [x for x in a.kw_defaults if x is not None])
+    return False
+
 
 
 def site_equiv(rel: str, site: Site, cmps: list, dicts: dict) -> bool:
