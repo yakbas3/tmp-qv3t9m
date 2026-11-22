@@ -1351,6 +1351,14 @@ class Analyzer:
         self._tree_cache = None
         self.warned = None  # tests that raise a warning on the pinned tree
         self._inert_probe = None  # rel under a tpc_inert probe
+        # what a pytest session reads before any test runs, outside the map's
+        # test buckets (tools/startup_reads.sh); None: unknown, nothing is inert
+        self.startup = None
+        try:
+            st = json.load(open(os.path.join(APP, "startup_reads.json")))
+            self.startup = set(st["opened"]) | set(st["executor_modules"])
+        except Exception:  # noqa: BLE001
+            pass
         try:
             self.warned = json.loads(gzip.decompress(open(os.path.join(APP, "warn.json.gz"), "rb").read()))
         except Exception:  # noqa: BLE001
@@ -1372,6 +1380,9 @@ class Analyzer:
         if base in CONFIG_FILES or base == "__init__.py" or rel in RISK_TEST_LIVE:
             return None
         if not os.path.isfile(os.path.join(SRC, rel)) or os.path.islink(os.path.join(SRC, rel)):
+            return None
+        # read at pytest startup or collection, where the map credits no test
+        if self.startup is None or rel in self.startup:
             return None
         mp = self.mp
         why = None
